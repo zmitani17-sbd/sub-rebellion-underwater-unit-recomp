@@ -129,8 +129,12 @@ full-screen sprites). The patch adds `PS2X_RUNTIME_LIB_COMPILE_OPTIONS` so the r
 can be built at `-O2` while the generated code stays at `-O1`; `setup_linux.sh` uses it. A
 desktop CPU will be faster, but a GPU renderer is what would make it full speed.
 
-Windows: PS2Recomp is developed mainly with MSVC; the same steps should work with CMake and
-Visual Studio 2022 but haven't been tried for this game.
+Windows: `tools/build_windows.sh` cross-compiles a Windows build on Linux with MinGW-w64 (after
+`setup_linux.sh`) into `dist/windows/`: a static `SubRebellion.exe` that needs only Windows' own
+DLLs, `extract_disc.exe` (C++ port of `tools/iso9660.py`, takes `.bin` or `.iso`), `Setup.cmd`
+(unpacks the user's disc image into `game\`), `Play Sub Rebellion.cmd` (logs to `log.txt`) and a
+README with the controls (from `windows/`). Tested under Wine 9: boots, takes input, reaches the
+title screen. An MSVC build should also work but hasn't been tried for this game.
 
 ## Next
 
@@ -142,7 +146,7 @@ Visual Studio 2022 but haven't been tried for this game.
    decode the `.DSI` streams on the host. Until then they're skipped.
 4. **Speed**: about 3 frames per second in the cloud container, nearly all in the software GS
    renderer. GPU rendering would make it full speed.
-5. **Windows build**, to run it on a desktop PC.
+5. **Windows testing** on real hardware (see Rebuild for the cross-build).
 
 ## Debugging notes
 

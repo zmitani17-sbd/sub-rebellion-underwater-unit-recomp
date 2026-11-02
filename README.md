@@ -154,8 +154,16 @@ title screen. On a Ryzen 7 9800X3D + RX 9070 XT the first build (single-threaded
 
 ## Next
 
-1. **Into a mission.** The intro plays; keep pressing through it (or find what ends it) and see
-   whether gameplay loads and responds to the pad.
+1. **Intro hang at "all were forced to adopt new forms."** Reproduced in the cloud and on
+   Windows. Before it, the grey scenes ("Peoples, nations, economies...") are not hung: the game
+   thread is pegged, about 40% of it in the VU1 interpreter (`commitReadyPipelines`,
+   `calculatePairReadyCycle`) plus triangle drawing, and the scene renders as flat grey (likely
+   a separate bug, e.g. fog). At the hang the game thread instead spins in the IOP emulator
+   (`IopCpuCore::executeInstruction`, `IopKernel::beginNextReady`): the IOP side, most likely
+   `MUS.IRX` streaming the narration `\XA\AQUAOPEN.VSD`, polls for sound hardware (SPU2) progress
+   that never happens. Next: find the IOP PC it loops at (add an IOP PC sample under an env var),
+   then either fake the SPU2 status it waits for or emulate SPU2 voices/ADPCM (which also brings
+   sound). The intro's subtitles are frame-timed (`demo_sub_main` counts frames), not audio-timed.
 2. **Sound**: SPU2 voices/ADPCM so `MUS.IRX`, `MODHSYN` and the `XA\*.VSD` streams play (the intro
    opens `\XA\AQUAOPEN.VSD`, its narration).
 3. **Movies, properly**: IPU emulation (MPEG-2 decode plus colour conversion through IPU DMA), or

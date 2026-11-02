@@ -9,11 +9,13 @@ the game's executable) are gitignored and recreated from your own disc.
 
 ## Status
 
-The recompiled game boots and runs its front end: memory-card prompt, title screen ("press
-START button"), main menu (NEW GAME / OPTION), difficulty select (EASY / NORMAL / HARD) and the
-"NOW LOADING..." screen, all drawn correctly and driven by the keyboard. The three logo movies
-are skipped by a runtime override (`overrides/`), because the PS2's MPEG decoder (IPU) isn't
-emulated. Getting from the loading screen into a mission is the current step.
+The recompiled game boots, runs its front end (memory-card prompt, title screen, NEW GAME,
+difficulty select, "NOW LOADING..."), and plays the in-engine 3D intro: textured seabed, rock
+walls, fog, light on the sea floor, fish and a sea turtle swimming past, with the subtitles
+"Fifteen years ago. / two thirds of the earth was submerged / due to movement of the earth's
+crust." It is driven by the keyboard. The three logo movies are skipped by a runtime override
+(`overrides/`), because the PS2's MPEG decoder (IPU) isn't emulated. No sound yet. Next: get
+from the intro into a playable mission.
 
 | Stage | State |
 |---|---|
@@ -26,7 +28,7 @@ emulated. Getting from the loading screen into a mission is the current step.
 | Front end (title, menus, loading screen) | Working |
 | Movies (`0\*.DSI`) | Skipped (`overrides/zz_sub_rebellion_overrides.cpp`). Playing them needs IPU emulation; PS2Recomp has none |
 | Sound (`MUS.IRX`, `XA\*.VSD`) | Not reached. SPU2 isn't emulated (register stubs only) |
-| 3D (VU1 microcode) | Not reached. The VU1 interpreter already logs `[VU1 reserved lower] pc=0x3090 instruction=0xfffffffb` about 10 times a second from the title screen on; VU1 memory there doesn't hold the game's code (`.vutext` has `088857ff` at 0x3090), so check the microcode upload (MPG) before 3D |
+| 3D (VU1 microcode) | Working in the intro, after fix 6 |
 
 ## The game
 
@@ -69,6 +71,17 @@ Applies to PS2Recomp commit `e563698`. Each fix was needed to get further:
    still pass. New test: `VIF1 image split across two DIRECTHL keeps the VIFcodes between them
    out of the image`.
 
+6. **VU1 `JR`/`JALR` read a stale VI register** (`vu/ps2_vu1_lower.cpp`). The interpreter gave
+   every branch the old value of a VI register written by the instruction just before it. That
+   is right for the conditional branches (IBEQ, IBNE, ...) but not for `JR`/`JALR`: PCSX2's
+   microVU applies the rule only to conditional branches and its interpreter's `_vuJR` reads the
+   register directly. Racjin's VU1 code starts every routine through a jump table, `B 0x340` with
+   `IADDIU vi1, vi0, <routine>` in the delay slot, then `JR vi1` at 0x340. With the stale vi1,
+   each call ran the previous routine instead, kicked garbage to the GS ("VU1 reserved lower
+   ... 0xfffffffb" was the XGKICK overflow code) and no 3D was drawn. Upstream's test `JR shares
+   the one-instruction VI branch visibility rule` asserted the old behaviour; it is replaced by
+   `JR uses a VI value written by the instruction just before it`.
+
 Also in the patch, off unless set (the lookups are cached, so they cost nothing when unset):
 - `PS2X_FRAME_DUMP=<dir>`: every 30th presented frame as raw RGBA, display-register probes, and
   at present 150 a dump of GS memory (`vram.bin`) and EE RAM (`eeram.bin`).
@@ -76,11 +89,15 @@ Also in the patch, off unless set (the lookups are cached, so they cost nothing 
 - `PS2X_SPRITE_LOG=1`: one line per distinct textured sprite setup and per distinct GS transfer.
 - `PS2X_SEQ_LOG=1`: GIF submissions (path, size, tag, payload hash) and GS draws/transfers in a
   fixed window, plus the first sizeable IMAGE payload to `image_payload.bin`.
+- `PS2X_VU_LOG=1`: VU1 `MPG` uploads, `MSCAL` starts, every `XGKICK` (address register, value,
+  first GIF tag), XGKICK overflows with the packet walked, and GIF packets/bytes per path every
+  5 seconds.
+- `PS2X_RUNTIME_LIB_COMPILE_OPTIONS` (CMake): build the runtime library at e.g. `-O2`.
 
 PS2Recomp's test suite (built with `-DNDEBUG`, since an existing thread-affinity assert aborts
 it otherwise): 446 passed, 1 failure (`VU0 macro mappings cover all S1/S2 enums`, which can't
 find `instructions.h` from the test's working directory). That failure is there without the
-patch too.
+patch too. The patch adds one test (fix 5) and replaces one (fix 6).
 
 ## Game-specific overrides (`overrides/`)
 
@@ -117,14 +134,15 @@ Visual Studio 2022 but haven't been tried for this game.
 
 ## Next
 
-1. **Into a mission.** After NORMAL the game shows "NOW LOADING..." and, a couple of minutes later
-   in the cloud container, opens `\XA\AQUAOPEN.VSD` (an ADPCM stream). See what follows; if it
-   waits on the stream, the `MUS.IRX` stand-in or SPU2 needs to report progress.
-2. **Movies, properly**: IPU emulation (MPEG-2 decode plus colour conversion through IPU DMA), or
-   decode the `.DSI` streams on the host. Until then they're skipped (see above).
-3. **VU1 microcode upload**: VU1 runs into `0xfffffffb` at 0x3090 (see Status) before any 3D.
-4. **Sound**: SPU2 voices/ADPCM so `MUS.IRX`, `MODHSYN` and the `XA\*.VSD` streams play.
-5. **Speed**: GPU rendering instead of the software GS for full speed.
+1. **Into a mission.** The intro plays; keep pressing through it (or find what ends it) and see
+   whether gameplay loads and responds to the pad.
+2. **Sound**: SPU2 voices/ADPCM so `MUS.IRX`, `MODHSYN` and the `XA\*.VSD` streams play (the intro
+   opens `\XA\AQUAOPEN.VSD`, its narration).
+3. **Movies, properly**: IPU emulation (MPEG-2 decode plus colour conversion through IPU DMA), or
+   decode the `.DSI` streams on the host. Until then they're skipped.
+4. **Speed**: about 3 frames per second in the cloud container, nearly all in the software GS
+   renderer. GPU rendering would make it full speed.
+5. **Windows build**, to run it on a desktop PC.
 
 ## Debugging notes
 
@@ -134,6 +152,12 @@ Visual Studio 2022 but haven't been tried for this game.
   e.g. `break readInit_0x10ad18`. Guest registers are 16 bytes apart in `R5900Context`
   (`*(int*)((char*)$rsi + 16*N)` is `$N` inside a recompiled function).
 - `tools/run_headless.sh` uses llvmpipe; Xvfb screenshots stay black, frame dumps don't.
+- VU1 microcode: `python3 tools/vudis.py --build game/SLUS_205.48 vu1code.bin` rebuilds VU1
+  code memory (eight `MPG` uploads stored in `.vutext`, each after a "NOP; MPG" pair), then
+  `python3 tools/vudis.py vu1code.bin 340 24` disassembles. Routine entry points are the ELF's
+  absolute symbols `racMpgVu1*` (MSCAL immediates: `racMpgVu1MulMtx` = 0x2E → address 0x170);
+  each is a jump-table entry that loads the routine's address into vi1 and branches to the
+  `JR vi1` dispatcher at 0x340.
 - The memory-card "no data" screen is normal for an empty card; no card fix was needed.
 - Text problems on the GS side: dump GS memory (`PS2X_FRAME_DUMP`, `vram.bin`) and decode the
   font page with PS2Recomp's own `GSMem` swizzle helpers (call `GSMem::InitLookupTables()`

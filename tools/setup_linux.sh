@@ -5,8 +5,8 @@
 #
 # Steps: install packages, clone PS2Recomp at the tested commit and apply our patch, build the
 # analyzer and recompiler, unpack the disc into game/, recompile SLUS_205.48 into output/, copy
-# the generated code into the runtime, and build ps2EntryRunner. Each step is skipped when its
-# output exists. Takes ~15 minutes on 2 cores, mostly the final compile.
+# the generated code and overrides/ into the runtime, and build ps2EntryRunner. Each step is
+# skipped when its output exists. Takes ~15 minutes on 2 cores, mostly the final compile.
 set -euo pipefail
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 cd "$ROOT"
@@ -45,13 +45,14 @@ fi
 
 cp output/*.cpp PS2Recomp/ps2xRuntime/src/runner/
 cp output/*.h PS2Recomp/ps2xRuntime/include/
+cp overrides/*.cpp PS2Recomp/ps2xRuntime/src/runner/   # game-specific runtime overrides
 
 if [ ! -d PS2Recomp/out/rt ]; then
   cmake -S PS2Recomp -B PS2Recomp/out/rt -DCMAKE_BUILD_TYPE=None \
     -DCMAKE_CXX_FLAGS="-O1 -g0 -msse4.1 -mavx2" \
     -DPS2X_BUILD_RECOMP=OFF -DPS2X_BUILD_ANALYZER=OFF -DPS2X_BUILD_TEST=OFF -DPS2X_BUILD_STUDIO=OFF \
     -DPS2X_BUILD_RUNTIME=ON -DPS2X_ENABLE_FFMPEG=OFF -DPS2X_ENABLE_DEBUG_UI=OFF \
-    -DPS2X_ENABLE_AGRESSIVE_LOGS=OFF
+    -DPS2X_ENABLE_AGRESSIVE_LOGS=OFF -DPS2X_RUNTIME_LIB_COMPILE_OPTIONS=-O2
 fi
 cmake --build PS2Recomp/out/rt -j"$(nproc)" --target ps2EntryRunner
 echo "Built PS2Recomp/out/rt/ps2xRuntime/ps2EntryRunner. Try: tools/run_headless.sh 60 run"

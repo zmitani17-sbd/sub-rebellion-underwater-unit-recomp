@@ -9,12 +9,11 @@ the game's executable) are gitignored and recreated from your own disc.
 
 ## Status
 
-The recompiled game boots, loads its nine IOP modules, runs its start-up, enters its main loop
-(object update, VIF1 packet build, DMA, vblank-paced flips) and draws its first screen, the
-memory-card prompt, with correct text: "There is no data for this title on the memory card (8MB)
-(for PlayStation®2) in MEMORY CARD slot 1. Start the game without loading data?". Pressing ✕
-answers it, and the game moves on to the Irem logo movie, which stays black: the PS2's MPEG
-decoder (IPU) isn't emulated. That is the current blocker.
+The recompiled game boots and runs its front end: memory-card prompt, title screen ("press
+START button"), main menu (NEW GAME / OPTION), difficulty select (EASY / NORMAL / HARD) and the
+"NOW LOADING..." screen, all drawn correctly and driven by the keyboard. The three logo movies
+are skipped by a runtime override (`overrides/`), because the PS2's MPEG decoder (IPU) isn't
+emulated. Getting from the loading screen into a mission is the current step.
 
 | Stage | State |
 |---|---|
@@ -24,9 +23,10 @@ decoder (IPU) isn't emulated. That is the current blocker.
 | Memory card | Working: an empty card gives the normal "no data" prompt |
 | Font/text | Working, after fix 5 |
 | Pad input | Working (keyboard through raylib; see `tools/run_headless.sh` for the keys) |
-| Movies (`0\*.DSI`) | **Blocker.** Logo movie starts, screen stays black. Needs IPU emulation; PS2Recomp has none |
+| Front end (title, menus, loading screen) | Working |
+| Movies (`0\*.DSI`) | Skipped (`overrides/zz_sub_rebellion_overrides.cpp`). Playing them needs IPU emulation; PS2Recomp has none |
 | Sound (`MUS.IRX`, `XA\*.VSD`) | Not reached. SPU2 isn't emulated (register stubs only) |
-| 3D (VU1 microcode) | Not reached |
+| 3D (VU1 microcode) | Not reached. The VU1 interpreter already logs `[VU1 reserved lower] pc=0x3090 instruction=0xfffffffb` about 10 times a second from the title screen on; VU1 memory there doesn't hold the game's code (`.vutext` has `088857ff` at 0x3090), so check the microcode upload (MPG) before 3D |
 
 ## The game
 
@@ -82,13 +82,23 @@ it otherwise): 446 passed, 1 failure (`VU0 macro mappings cover all S1/S2 enums`
 find `instructions.h` from the test's working directory). That failure is there without the
 patch too.
 
+## Game-specific overrides (`overrides/`)
+
+`zz_sub_rebellion_overrides.cpp` registers a PS2Recomp game override for `SLUS_205.48`. It
+replaces `racMoviePlay` (0x114218) with a stand-in that returns 0 without creating the movie
+object, which is what the game does for an unknown movie id; no caller uses the result. The
+logo sequence then moves straight on. Set `PS2X_PLAY_MOVIES=1` to turn the skip off.
+`tools/setup_linux.sh` copies `overrides/*.cpp` into `ps2xRuntime/src/runner/`; the `zz_` name
+keeps it in the last unity-build batch, so editing it rebuilds in about 10 seconds.
+
 ## Rebuild
 
 Linux (what was used, Ubuntu 24.04 cloud container):
 
 ```
 tools/setup_linux.sh "/path/to/Sub Rebellion (USA).bin"
-KEYS="20:x" tools/run_headless.sh 60 run     # ✕ at 20 s answers the memory-card prompt
+KEYS="20:x 40:Return 50:Return 60:Return 75:x 90:x" tools/run_headless.sh 240 run
+    # ✕ answers the card prompt, Enter (Start) at the title, ✕ picks NEW GAME, then NORMAL
 python3 tools/frames_to_png.py run/frames
 ```
 
@@ -96,23 +106,25 @@ The disc image is over the 400 MB per-file transfer limit between the PC and the
 `tools/split-sub-rebellion.cmd` (double-click on Windows) copies it into two pieces in
 `Downloads\sub-rebellion-parts`; rejoin with `cat part0 part1 > subreb.bin`.
 
+Speed: in the 2-core cloud container the game runs at about 3 frames per second, almost all of
+it in PS2Recomp's software GS renderer (`GSCpuBackend::DrawSprite`/`WritePixel`, filling
+full-screen sprites). The patch adds `PS2X_RUNTIME_LIB_COMPILE_OPTIONS` so the runtime library
+can be built at `-O2` while the generated code stays at `-O1`; `setup_linux.sh` uses it. A
+desktop CPU will be faster, but a GPU renderer is what would make it full speed.
+
 Windows: PS2Recomp is developed mainly with MSVC; the same steps should work with CMake and
 Visual Studio 2022 but haven't been tried for this game.
 
 ## Next
 
-1. **Movies (current blocker).** After ✕ the game runs `game_logo_movie` → `racMovieStart` →
-   `racMovieStartCdvd`, whose `MovieProc` thread streams the `.DSI` file and feeds the IPU
-   (`setDMAtoIPU` is called once; `IpuHandler` never runs). `playMovie`/`onDrawMovie` are called
-   every frame and draw nothing. Two ways forward:
-   - Quick: make the game treat each movie as finished, to see the title screen and menus. The
-     candidates are `racMovieCheckDEndCdvd` (reads byte 5 of the movie state at `*0x274E34`),
-     `getMovieDoneFlag` (`-0x571C($gp)`) and the movie object's state bytes `0xB4`–`0xB7` that
-     `playMovie` updates. Best done as a runtime game override so it doesn't force a full rebuild.
-   - Proper: IPU emulation (MPEG-2 I/P/B decode plus colour conversion through IPU DMA), or
-     decoding the `.DSI` streams on the host.
-2. **Sound**: SPU2 voices/ADPCM so `MUS.IRX`, `MODHSYN` and the `XA\*.VSD` streams play.
-3. **3D**: run the VU1 microcode through the runtime's VU1 interpreter once a mission loads.
+1. **Into a mission.** After NORMAL the game shows "NOW LOADING..." and, a couple of minutes later
+   in the cloud container, opens `\XA\AQUAOPEN.VSD` (an ADPCM stream). See what follows; if it
+   waits on the stream, the `MUS.IRX` stand-in or SPU2 needs to report progress.
+2. **Movies, properly**: IPU emulation (MPEG-2 decode plus colour conversion through IPU DMA), or
+   decode the `.DSI` streams on the host. Until then they're skipped (see above).
+3. **VU1 microcode upload**: VU1 runs into `0xfffffffb` at 0x3090 (see Status) before any 3D.
+4. **Sound**: SPU2 voices/ADPCM so `MUS.IRX`, `MODHSYN` and the `XA\*.VSD` streams play.
+5. **Speed**: GPU rendering instead of the software GS for full speed.
 
 ## Debugging notes
 

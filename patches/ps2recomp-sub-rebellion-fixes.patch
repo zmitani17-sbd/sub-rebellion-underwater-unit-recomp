@@ -33,6 +33,26 @@ index 420f053..a2759c3 100644
          }
      }
  
+diff --git a/ps2xRuntime/CMakeLists.txt b/ps2xRuntime/CMakeLists.txt
+index 589d768..2e98d83 100644
+--- a/ps2xRuntime/CMakeLists.txt
++++ b/ps2xRuntime/CMakeLists.txt
+@@ -396,6 +396,15 @@ add_library(ps2_runtime STATIC
+     src/lib/games_database.cpp
+ )
+ 
++# Extra compile options for the runtime library only, not the generated game code (e.g. "-O2"
++# while the generated code stays at -O1 to keep its compile time down). The software GS
++# renderer lives here and is the main per-frame cost.
++set(PS2X_RUNTIME_LIB_COMPILE_OPTIONS "" CACHE STRING "Extra compile options for ps2_runtime only")
++if(PS2X_RUNTIME_LIB_COMPILE_OPTIONS)
++    separate_arguments(PS2X_RUNTIME_LIB_COMPILE_OPTIONS_LIST NATIVE_COMMAND "${PS2X_RUNTIME_LIB_COMPILE_OPTIONS}")
++    target_compile_options(ps2_runtime PRIVATE ${PS2X_RUNTIME_LIB_COMPILE_OPTIONS_LIST})
++endif()
++
+ if(PS2X_ENABLE_RUNTIME_LOGS)
+     target_compile_definitions(ps2_runtime PUBLIC
+         PS2_RUNTIME_LOGS=1
 diff --git a/ps2xRuntime/include/runtime/ps2_memory.h b/ps2xRuntime/include/runtime/ps2_memory.h
 index ea86a9c..ef26cdd 100644
 --- a/ps2xRuntime/include/runtime/ps2_memory.h

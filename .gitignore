@@ -1,0 +1,24 @@
+# Game data: never committed. Supply your own disc.
+game/
+*.bin
+*.cue
+*.iso
+*.ELF
+SLUS_*
+
+# Generated from the game's executable by PS2Recomp (regenerated in about a second)
+output/
+
+# Upstream tool checkout and builds
+PS2Recomp/
+build/
+out/
+
+# Test runs, frame dumps, logs
+run*/
+*.rgba
+*.log
+
+# Python
+__pycache__/
+*.pyc

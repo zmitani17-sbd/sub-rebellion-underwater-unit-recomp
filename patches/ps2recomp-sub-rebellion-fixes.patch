@@ -1,0 +1,304 @@
+diff --git a/ps2xIOP/src/ps2_path.cpp b/ps2xIOP/src/ps2_path.cpp
+index 420f053..a2759c3 100644
+--- a/ps2xIOP/src/ps2_path.cpp
++++ b/ps2xIOP/src/ps2_path.cpp
+@@ -21,16 +21,22 @@ namespace ps2x::iop
+             while (!suffix.empty() && suffix.front() == '/')
+                 suffix.erase(suffix.begin());
+ 
+-            const size_t semicolon = suffix.rfind(';');
+-            if (semicolon == std::string::npos || semicolon + 1u == suffix.size())
+-                return;
++            // Strip ISO version suffixes. The PS2 CD filesystem ends a name at its first ';',
++            // so a doubled suffix ("FILE.DAT;1;1") still opens on hardware; strip them all.
++            for (;;)
++            {
++                const size_t semicolon = suffix.rfind(';');
++                if (semicolon == std::string::npos || semicolon + 1u == suffix.size())
++                    return;
+ 
+-            const bool numeric = std::all_of(suffix.begin() + static_cast<std::ptrdiff_t>(semicolon + 1u),
+-                                             suffix.end(),
+-                                             [](unsigned char ch)
+-                                             { return std::isdigit(ch) != 0; });
+-            if (numeric)
++                const bool numeric = std::all_of(suffix.begin() + static_cast<std::ptrdiff_t>(semicolon + 1u),
++                                                 suffix.end(),
++                                                 [](unsigned char ch)
++                                                 { return std::isdigit(ch) != 0; });
++                if (!numeric)
++                    return;
+                 suffix.erase(semicolon);
++            }
+         }
+     }
+ 
+diff --git a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+index c5e31c4..0e4382a 100644
+--- a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
++++ b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+@@ -1,3 +1,5 @@
++#include <cstdio>
++#include <cstdlib>
+ #include "runtime/ee_scheduler.h"
+ 
+ #include "ps2_log.h"
+@@ -173,6 +175,31 @@ void EeScheduler::run()
+                 copyMainContextToRuntime();
+                 publishIdleDebugContext();
+                 publishSnapshot();
++                {
++                    // Feasibility-check diagnostic: who is every guest thread waiting on?
++                    static auto lastDump = std::chrono::steady_clock::now();
++                    const auto now = std::chrono::steady_clock::now();
++                    if (std::getenv("PS2X_IDLE_DUMP") && now - lastDump > std::chrono::seconds(5))
++                    {
++                        lastDump = now;
++                        const EeKernelSnapshot s = snapshot();
++                        std::fprintf(stderr, "[idle-dump] eeCycle=%llu\n", static_cast<unsigned long long>(s.eeCycle));
++                        for (const auto &t : s.threads)
++                        {
++                            std::fprintf(stderr, "  thread %d status=%d wait=%d waitId=%d pc=%08x ra=%08x entry=%08x prio=%d\n",
++                                         t.id, static_cast<int>(t.status), static_cast<int>(t.waitReason), t.waitId,
++                                         t.pc, t.ra, t.entry, t.currentPriority);
++                        }
++                        for (const auto &m : s.semaphores)
++                        {
++                            std::fprintf(stderr, "  sema %d count=%d max=%d waiters=%u\n", m.id, m.count, m.maxCount, m.waiters);
++                        }
++                        for (const auto &e : s.eventFlags)
++                        {
++                            std::fprintf(stderr, "  evflag %d bits=%08x waiters=%u\n", e.id, e.bits, e.waiters);
++                        }
++                    }
++                }
+                 waitForEvent();
+                 continue;
+             }
+@@ -1237,25 +1264,46 @@ int EeScheduler::setIrqHandlerEnabled(bool dmac, int id, bool enabled)
+ int EeScheduler::setIrqCauseEnabled(bool dmac, uint32_t cause, bool enabled)
+ {
+     assertExecutor();
++    // The PS2 kernel's EnableIntc/DisableIntc (and the DMAC versions) return 1 when the
++    // call changed the cause's state and 0 when it was already in that state. Games use
++    // `was = DisableIntc(c); ...; if (was) EnableIntc(c);` as a critical section, so
++    // always returning 0 leaves the cause disabled for good.
+     if (cause < 32u)
+     {
+         uint32_t &mask = dmac ? m_enabledDmacMask : m_enabledIntcMask;
++        const uint32_t bit = 1u << cause;
++        const bool wasEnabled = (mask & bit) != 0u;
+         if (enabled)
+         {
+-            mask |= 1u << cause;
++            mask |= bit;
+         }
+         else
+         {
+-            mask &= ~(1u << cause);
++            mask &= ~bit;
+         }
++        return (wasEnabled != enabled) ? 1 : 0;
+     }
+-    return KE_OK;
++    return 0;
+ }
+ 
+ void EeScheduler::dispatchIrq(bool dmac, uint32_t cause)
+ {
+     assertExecutor();
+     const uint32_t mask = dmac ? m_enabledDmacMask : m_enabledIntcMask;
++    if (std::getenv("PS2X_IDLE_DUMP") && !dmac && cause == 2u)
++    {
++        static int dumps = 0;
++        if (dumps < 6 || (dumps % 300) == 0)
++        {
++            std::fprintf(stderr, "[irq-dump] vblank#%d intcMask=%08x handlers=%zu\n", dumps, mask, m_intcHandlers.size());
++            for (const auto &[hid, h] : m_intcHandlers)
++            {
++                std::fprintf(stderr, "    handler id=%d cause=%u fn=%08x enabled=%d known=%d\n", hid, h.cause, h.handler,
++                             h.enabled ? 1 : 0, m_runtime.hasFunction(h.handler) ? 1 : 0);
++            }
++        }
++        ++dumps;
++    }
+     if (cause < 32u && (mask & (1u << cause)) == 0u)
+     {
+         return;
+diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/Helpers/Support.h b/ps2xRuntime/src/lib/Kernel/Stubs/Helpers/Support.h
+index b1bb6d8..d2857a6 100644
+--- a/ps2xRuntime/src/lib/Kernel/Stubs/Helpers/Support.h
++++ b/ps2xRuntime/src/lib/Kernel/Stubs/Helpers/Support.h
+@@ -48,7 +48,9 @@ namespace
+         bool numericSuffix = semicolon + 1 < value.size();
+         for (std::size_t i = semicolon + 1; i < value.size(); ++i)
+         {
+-            if (!std::isdigit(static_cast<unsigned char>(value[i])))
++            // The PS2 CD filesystem ends a name at its first ';', so games that append the
++            // version twice ("FILE.DAT;1;1") still open the file on hardware.
++            if (!std::isdigit(static_cast<unsigned char>(value[i])) && value[i] != ';')
+             {
+                 numericSuffix = false;
+                 break;
+@@ -1814,6 +1816,13 @@ namespace
+         std::memcpy(&env, ptr, sizeof(env));
+         env.dispfb = dispfb;
+         env.display = display;
++        // Sony's sceGsSetDefDispEnv also fills PMODE (read circuit 2 on, MMOD=1, ALP=0),
++        // SMODE2 (the interlace/field mode from sceGsResetGraph) and BGCOLOR. Leaving
++        // them zero means sceGsPutDispEnv writes PMODE=0 and both display circuits stay off.
++        env.pmode = makePmode(0u, 1u, 1u, 0u, 0u, 0u);
++        env.smode2 = static_cast<uint64_t>(g_gparam.interlace & 0x1u) |
++                     (static_cast<uint64_t>(g_gparam.ffmode & 0x1u) << 1);
++        env.bgcolor = 0u;
+         std::memcpy(ptr, &env, sizeof(env));
+         return true;
+     }
+diff --git a/ps2xRuntime/src/lib/Kernel/Syscalls/Helpers/Path.h b/ps2xRuntime/src/lib/Kernel/Syscalls/Helpers/Path.h
+index 712fe7c..90df70e 100644
+--- a/ps2xRuntime/src/lib/Kernel/Syscalls/Helpers/Path.h
++++ b/ps2xRuntime/src/lib/Kernel/Syscalls/Helpers/Path.h
+@@ -21,7 +21,9 @@ namespace
+         bool numericSuffix = semicolon + 1 < value.size();
+         for (std::size_t i = semicolon + 1; i < value.size(); ++i)
+         {
+-            if (!std::isdigit(static_cast<unsigned char>(value[i])))
++            // The PS2 CD filesystem ends a name at its first ';', so games that append the
++            // version twice ("FILE.DAT;1;1") still open the file on hardware.
++            if (!std::isdigit(static_cast<unsigned char>(value[i])) && value[i] != ';')
+             {
+                 numericSuffix = false;
+                 break;
+diff --git a/ps2xRuntime/src/lib/Kernel/Syscalls/Sync.cpp b/ps2xRuntime/src/lib/Kernel/Syscalls/Sync.cpp
+index 33945fc..7476ed8 100644
+--- a/ps2xRuntime/src/lib/Kernel/Syscalls/Sync.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Syscalls/Sync.cpp
+@@ -143,7 +143,9 @@ namespace ps2_syscalls
+         status->wait_threads = static_cast<int>(semaphore->waiters.size());
+         status->attr = semaphore->attr;
+         status->option = semaphore->option;
+-        setReturnS32(ctx, KE_OK);
++        // The PS2 kernel returns the semaphore ID on success, and games compare against it
++        // (e.g. `if (ReferSemaStatus(id, &s) == id && s.count < s.max_count) SignalSema(id)`).
++        setReturnS32(ctx, static_cast<int32_t>(getRegU32(ctx, 4)));
+     }
+ 
+     void iReferSemaStatus(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+diff --git a/ps2xRuntime/src/lib/gs/gs_frontend.cpp b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
+index 9281d5f..1e482e5 100644
+--- a/ps2xRuntime/src/lib/gs/gs_frontend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
+@@ -552,6 +552,19 @@ void GS::latchHostPresentationFrame()
+     }
+ 
+     const bool hasFrame = static_cast<bool>(frame);
++    if (std::getenv("PS2X_FRAME_DUMP"))
++    {
++        static uint32_t s_latchProbe = 0u;
++        if ((s_latchProbe++ % 60u) == 0u)
++        {
++            std::fprintf(stderr, "[latch-probe] n=%u hasFrame=%d pmode=%llx smode2=%llx dispfb1=%llx display1=%llx dispfb2=%llx display2=%llx ctx0frame.fbp=%u fbw=%u\n",
++                         s_latchProbe, hasFrame ? 1 : 0,
++                         (unsigned long long)request.pmode, (unsigned long long)request.smode2,
++                         (unsigned long long)request.dispfb1, (unsigned long long)request.display1,
++                         (unsigned long long)request.dispfb2, (unsigned long long)request.display2,
++                         (unsigned)request.contextFrames[0].fbp, (unsigned)request.contextFrames[0].fbw);
++        }
++    }
+     const uint32_t displayFbp = frame.displayFbp;
+     const uint32_t sourceFbp = frame.sourceFbp;
+     const uint32_t width = frame.width;
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index 45cb9d2..0fa2740 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -1,3 +1,5 @@
++#include <cstdio>
++#include <cstdlib>
+ #include "ps2_runtime.h"
+ #include "ps2_log.h"
+ #include "ps2_stubs.h"
+@@ -407,12 +409,25 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
+     uint32_t displayFbp = 0u;
+     uint32_t sourceFbp = 0u;
+     bool usedPreferredDisplaySource = false;
+-    if (!rt->gs().copyLatchedHostPresentationFrame(s_scratch,
++    const bool copiedFrame = rt->gs().copyLatchedHostPresentationFrame(s_scratch,
+                                                    width,
+                                                    height,
+                                                    &displayFbp,
+                                                    &sourceFbp,
+-                                                   &usedPreferredDisplaySource))
++                                                   &usedPreferredDisplaySource);
++    if (std::getenv("PS2X_FRAME_DUMP"))
++    {
++        static uint32_t s_probe = 0u;
++        if ((s_probe++ % 60u) == 0u)
++        {
++            size_t lit = 0u;
++            for (size_t i = 0; i + 3 < s_scratch.size(); i += 4)
++                lit += (s_scratch[i] | s_scratch[i + 1] | s_scratch[i + 2]) != 0u;
++            std::fprintf(stderr, "[frame-probe] n=%u copied=%d size=%ux%u bytes=%zu lit=%zu displayFbp=%u sourceFbp=%u\n",
++                         s_probe, copiedFrame ? 1 : 0, width, height, s_scratch.size(), lit, displayFbp, sourceFbp);
++        }
++    }
++    if (!copiedFrame)
+     {
+         Image blank = GenImageColor(FB_WIDTH, FB_HEIGHT, MAGENTA);
+         UpdateTexture(tex, blank.data);
+@@ -444,6 +459,21 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
+         }
+         ++s_uploadDebugCount;
+     });
++    if (const char *dumpDir = std::getenv("PS2X_FRAME_DUMP"); dumpDir && *dumpDir && !s_scratch.empty())
++    {
++        // Feasibility-check diagnostic: write every 30th presented frame as raw RGBA.
++        static uint32_t s_dumpCounter = 0u;
++        if ((s_dumpCounter++ % 30u) == 0u)
++        {
++            char name[512];
++            std::snprintf(name, sizeof(name), "%s/frame_%05u_%ux%u_fbp%u.rgba", dumpDir, s_dumpCounter, width, height, displayFbp);
++            if (FILE *f = std::fopen(name, "wb"))
++            {
++                std::fwrite(s_scratch.data(), 1, s_scratch.size(), f);
++                std::fclose(f);
++            }
++        }
++    }
+     s_lastDisplayFbp = displayFbp;
+     s_lastSourceFbp = sourceFbp;
+     s_lastPreferred = usedPreferredDisplaySource;
+diff --git a/ps2xTest/src/ps2_runtime_interrupt_tests.cpp b/ps2xTest/src/ps2_runtime_interrupt_tests.cpp
+index 4261bfa..f9546e1 100644
+--- a/ps2xTest/src/ps2_runtime_interrupt_tests.cpp
++++ b/ps2xTest/src/ps2_runtime_interrupt_tests.cpp
+@@ -403,25 +403,25 @@ void register_ps2_runtime_interrupt_tests()
+             setRegU32(disableIntcCtx, 4, 2u);
+             t.IsTrue(callSyscall(static_cast<uint32_t>(-0x1B), env.rdram.data(), &disableIntcCtx, &env.runtime),
+                      "negative iDisableIntc syscall id should dispatch");
+-            t.Equals(getRegS32(disableIntcCtx, 2), KE_OK, "negative iDisableIntc should return KE_OK");
++            t.Equals(getRegS32(disableIntcCtx, 2), 1, "negative iDisableIntc should return 1 when it disables an enabled cause");
+ 
+             R5900Context enableIntcCtx{};
+             setRegU32(enableIntcCtx, 4, 2u);
+             t.IsTrue(callSyscall(static_cast<uint32_t>(-0x1A), env.rdram.data(), &enableIntcCtx, &env.runtime),
+                      "negative iEnableIntc syscall id should dispatch");
+-            t.Equals(getRegS32(enableIntcCtx, 2), KE_OK, "negative iEnableIntc should return KE_OK");
++            t.Equals(getRegS32(enableIntcCtx, 2), 1, "negative iEnableIntc should return 1 when it re-enables a disabled cause");
+ 
+             R5900Context disableDmacCtx{};
+             setRegU32(disableDmacCtx, 4, 5u);
+             t.IsTrue(callSyscall(static_cast<uint32_t>(-0x1D), env.rdram.data(), &disableDmacCtx, &env.runtime),
+                      "negative iDisableDmac syscall id should dispatch");
+-            t.Equals(getRegS32(disableDmacCtx, 2), KE_OK, "negative iDisableDmac should return KE_OK");
++            t.Equals(getRegS32(disableDmacCtx, 2), 1, "negative iDisableDmac should return 1 when it disables an enabled channel");
+ 
+             R5900Context enableDmacCtx{};
+             setRegU32(enableDmacCtx, 4, 5u);
+             t.IsTrue(callSyscall(static_cast<uint32_t>(-0x1C), env.rdram.data(), &enableDmacCtx, &env.runtime),
+                      "negative iEnableDmac syscall id should dispatch");
+-            t.Equals(getRegS32(enableDmacCtx, 2), KE_OK, "negative iEnableDmac should return KE_OK");
++            t.Equals(getRegS32(enableDmacCtx, 2), 1, "negative iEnableDmac should return 1 when it re-enables a disabled channel");
+ 
+             R5900Context setEventFlagCtx{};
+             setRegU32(setEventFlagCtx, 4, static_cast<uint32_t>(eid));

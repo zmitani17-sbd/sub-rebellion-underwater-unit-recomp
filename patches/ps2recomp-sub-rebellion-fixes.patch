@@ -1,3 +1,235 @@
+diff --git a/ps2xIOP/include/ps2x/iop/iop_host.h b/ps2xIOP/include/ps2x/iop/iop_host.h
+index 1eceb08..9a477c0 100644
+--- a/ps2xIOP/include/ps2x/iop/iop_host.h
++++ b/ps2xIOP/include/ps2x/iop/iop_host.h
+@@ -130,6 +130,25 @@ namespace ps2x::iop
+             return false;
+         }
+ 
++        // IOP -> EE RPC (an IRX calling sceSifBindRpc/sceSifCallRpc on a server the EE registered
++        // with sceSifRegisterRpc). findEeRpcServer returns the EE server data address for a server
++        // id; callEeRpc runs that server's function on a copy of the sent data. The defaults keep
++        // hosts without an EE RPC dispatcher source-compatible.
++        virtual bool findEeRpcServer(uint32_t sid, uint32_t &serverData)
++        {
++            (void)sid;
++            serverData = 0u;
++            return false;
++        }
++        virtual bool callEeRpc(uint32_t serverData, uint32_t rpcNumber, const void *data, size_t size)
++        {
++            (void)serverData;
++            (void)rpcNumber;
++            (void)data;
++            (void)size;
++            return false;
++        }
++
+         virtual void log(LogLevel level, std::string_view message) = 0;
+     };
+ }
+diff --git a/ps2xIOP/src/emulator/core/iop_memory.cpp b/ps2xIOP/src/emulator/core/iop_memory.cpp
+index 25e9b36..814b93a 100644
+--- a/ps2xIOP/src/emulator/core/iop_memory.cpp
++++ b/ps2xIOP/src/emulator/core/iop_memory.cpp
+@@ -1,3 +1,8 @@
++#include <vector>
++#include <unordered_map>
++#include <cstdlib>
++#include <cstdio>
++#include <mutex>
+ #include "iop_memory.h"
+ 
+ #include <algorithm>
+@@ -211,8 +216,32 @@ namespace ps2x::iop::detail
+                (phys >= SifBase && phys < SifEnd);
+     }
+ 
++    namespace
++    {
++        std::mutex g_hwReadStatsMutex;
++        std::unordered_map<uint32_t, uint64_t> g_hwReadStats;
++    }
++
++    void iopHardwareReadStatsDump()
++    {
++        std::lock_guard<std::mutex> lock(g_hwReadStatsMutex);
++        std::vector<std::pair<uint32_t, uint64_t>> top(g_hwReadStats.begin(), g_hwReadStats.end());
++        std::sort(top.begin(), top.end(), [](const auto &a, const auto &b) { return a.second > b.second; });
++        std::fprintf(stderr, "[iop-hw-reads]");
++        for (size_t i = 0; i < top.size() && i < 10; ++i)
++            std::fprintf(stderr, " %08x:%llu", top[i].first, static_cast<unsigned long long>(top[i].second));
++        std::fprintf(stderr, "\n");
++        g_hwReadStats.clear();
++    }
++
+     uint32_t IopMemory::readHardware32(uint32_t address) const
+     {
++        static const bool s_iopPcLog = std::getenv("PS2X_IOP_PC_LOG") != nullptr;
++        if (s_iopPcLog)
++        {
++            std::lock_guard<std::mutex> lock(g_hwReadStatsMutex);
++            ++g_hwReadStats[address];
++        }
+         const auto value = m_hardware.find(address);
+         if (value != m_hardware.end())
+             return value->second;
+diff --git a/ps2xIOP/src/emulator/core/iop_memory.h b/ps2xIOP/src/emulator/core/iop_memory.h
+index a932a5d..79f494c 100644
+--- a/ps2xIOP/src/emulator/core/iop_memory.h
++++ b/ps2xIOP/src/emulator/core/iop_memory.h
+@@ -10,6 +10,8 @@
+ 
+ namespace ps2x::iop::detail
+ {
++    void iopHardwareReadStatsDump(); // diagnostics (PS2X_IOP_PC_LOG)
++
+     class IopMemory
+     {
+     public:
+diff --git a/ps2xIOP/src/emulator/iop_emulator.cpp b/ps2xIOP/src/emulator/iop_emulator.cpp
+index e5f63a9..021ed6b 100644
+--- a/ps2xIOP/src/emulator/iop_emulator.cpp
++++ b/ps2xIOP/src/emulator/iop_emulator.cpp
+@@ -1,3 +1,8 @@
++#include <vector>
++#include <unordered_map>
++#include <cstdlib>
++#include <cstdio>
++#include <chrono>
+ #include "iop_emulator.h"
+ #include "imports/iop_cdvd.h"
+ #include "core/iop_cpu.h"
+@@ -25,6 +30,30 @@
+ #include <sstream>
+ #include <utility>
+ 
++// Diagnostic (PS2X_IOP_PC_LOG): where IOP threads are when their timeslices end, plus the
++// most-read hardware registers, printed about every 3 seconds. Shows what a stuck driver polls.
++namespace
++{
++    void iopPcLogSample(uint32_t pc)
++    {
++        static std::unordered_map<uint32_t, uint32_t> counts;
++        static auto last = std::chrono::steady_clock::now();
++        ++counts[pc];
++        const auto now = std::chrono::steady_clock::now();
++        if (now - last < std::chrono::seconds(3))
++            return;
++        last = now;
++        std::vector<std::pair<uint32_t, uint32_t>> top(counts.begin(), counts.end());
++        std::sort(top.begin(), top.end(), [](const auto &a, const auto &b) { return a.second > b.second; });
++        std::fprintf(stderr, "[iop-pc]");
++        for (size_t i = 0; i < top.size() && i < 10; ++i)
++            std::fprintf(stderr, " %08x:%u", top[i].first, top[i].second);
++        std::fprintf(stderr, "\n");
++        counts.clear();
++        ps2x::iop::detail::iopHardwareReadStatsDump();
++    }
++}
++
+ namespace ps2x::iop::detail
+ {
+     namespace
+@@ -577,6 +606,9 @@ namespace ps2x::iop::detail
+                     }
+                     const uint64_t before = totalCycles;
+                     runCpu(next->cpu, static_cast<uint32_t>(std::min<uint64_t>(kDefaultSlice, target - totalCycles)));
++                    static const bool s_iopPcLog = std::getenv("PS2X_IOP_PC_LOG") != nullptr;
++                    if (s_iopPcLog)
++                        iopPcLogSample(next->cpu.pc);
+                     kernel.endTimeslice(*next, kThreadReturnSentinel);
+                     if (totalCycles == before)
+                         ++totalCycles;
+diff --git a/ps2xIOP/src/emulator/services/iop_rpc.cpp b/ps2xIOP/src/emulator/services/iop_rpc.cpp
+index cf4fdc6..d7ea762 100644
+--- a/ps2xIOP/src/emulator/services/iop_rpc.cpp
++++ b/ps2xIOP/src/emulator/services/iop_rpc.cpp
+@@ -148,10 +148,61 @@ namespace ps2x::iop::detail
+         case 10:
+         case 11:
+         case 14: // InitRpc
+-        case 15:
+-        case 16:
+             setV0(0);
+             return true;
++        case 15: // sceSifBindRpc(cd, sid, mode): bind to a server on the EE
++        {
++            // IOP SifRpcClientData_t: hdr (16 bytes), command 0x10, buff 0x14, cbuff 0x18,
++            // end_function 0x1C, end_param 0x20, server 0x24. Callers loop until server != 0, as
++            // on hardware when the EE hasn't registered the server yet.
++            const uint32_t client = cpu.gpr[4];
++            const uint32_t sid = cpu.gpr[5];
++            uint32_t serverData = 0u;
++            if (client != 0u && m_host.findEeRpcServer(sid, serverData) && serverData != 0u)
++            {
++                m_memory.write32(client + 0x24u, serverData);
++                m_eeRpcClients[client] = serverData;
++            }
++            setV0(0);
++            return true;
++        }
++        case 16: // sceSifCallRpc(cd, rpc_number, mode, send, ssize, receive, rsize, end_func, end_param)
++        {
++            const uint32_t client = cpu.gpr[4];
++            const uint32_t rpcNumber = cpu.gpr[5];
++            const uint32_t send = cpu.gpr[7];
++            const uint32_t stackPointer = cpu.gpr[29];
++            const uint32_t sendSize = m_memory.read32(stackPointer + 16u);
++            const uint32_t receive = m_memory.read32(stackPointer + 20u);
++            const uint32_t receiveSize = m_memory.read32(stackPointer + 24u);
++            const uint32_t endFunction = m_memory.read32(stackPointer + 28u);
++            uint32_t serverData = client != 0u ? m_memory.read32(client + 0x24u) : 0u;
++            if (serverData == 0u)
++            {
++                setV0(static_cast<uint32_t>(-1));
++                return true;
++            }
++            std::vector<uint8_t> payload;
++            if (sendSize != 0u && send != 0u && sendSize <= 0x10000u && m_memory.ownsRamRange(send, sendSize))
++            {
++                payload.resize(sendSize);
++                (void)m_memory.readRam(send, payload.data(), payload.size());
++            }
++            // The EE function runs as a queued EE request; the IOP caller doesn't wait for it. A
++            // reply (receive buffer) and an IOP end function aren't supported yet: log them once.
++            if ((receive != 0u && receiveSize != 0u) || endFunction != 0u)
++            {
++                static bool s_warned = false;
++                if (!s_warned)
++                {
++                    s_warned = true;
++                    m_host.log(LogLevel::Warning, "[IOP] sceSifCallRpc to the EE with a reply buffer or end function: not supported, ignored");
++                }
++            }
++            const bool queued = m_host.callEeRpc(serverData, rpcNumber, payload.data(), payload.size());
++            setV0(queued ? 0u : static_cast<uint32_t>(-1));
++            return true;
++        }
+         case 12: // sceSifSendCmd
+         case 13: // isceSifSendCmd
+         {
+@@ -230,7 +281,7 @@ namespace ps2x::iop::detail
+             setV0(server.serverData);
+             return true;
+         }
+-        case 18:
++        case 18: // sceSifCheckStatRpc: calls to the EE complete immediately here
+             setV0(0);
+             return true;
+         case 19: // SetRpcQueue
+diff --git a/ps2xIOP/src/emulator/services/iop_rpc.h b/ps2xIOP/src/emulator/services/iop_rpc.h
+index a4286ba..e8f98d9 100644
+--- a/ps2xIOP/src/emulator/services/iop_rpc.h
++++ b/ps2xIOP/src/emulator/services/iop_rpc.h
+@@ -72,6 +72,7 @@ namespace ps2x::iop::detail
+         IopMemory &m_memory;
+         IopKernel &m_kernel;
+         std::unordered_map<uint32_t, RpcServer> m_servers;
++        std::unordered_map<uint32_t, uint32_t> m_eeRpcClients; // IOP client data -> EE server data
+         uint32_t m_nextDmaId = 1u;
+         bool m_sifInitialized = false;
+     };
 diff --git a/ps2xIOP/src/ps2_path.cpp b/ps2xIOP/src/ps2_path.cpp
 index 420f053..a2759c3 100644
 --- a/ps2xIOP/src/ps2_path.cpp
@@ -216,6 +448,99 @@ index 712fe7c..90df70e 100644
              {
                  numericSuffix = false;
                  break;
+diff --git a/ps2xRuntime/src/lib/Kernel/Syscalls/RPC.cpp b/ps2xRuntime/src/lib/Kernel/Syscalls/RPC.cpp
+index 07fcd29..cc4028e 100644
+--- a/ps2xRuntime/src/lib/Kernel/Syscalls/RPC.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Syscalls/RPC.cpp
+@@ -814,6 +814,74 @@ namespace ps2_syscalls
+         setReturnS32(ctx, 0);
+     }
+ 
++    bool findRpcServerForIop(uint32_t sid, uint32_t &serverData)
++    {
++        std::lock_guard<std::mutex> lock(g_rpc_mutex);
++        const auto it = g_rpc_servers.find(sid);
++        serverData = it != g_rpc_servers.end() ? it->second.sd_ptr : 0u;
++        return serverData != 0u;
++    }
++
++    bool queueRpcFromIop(uint8_t *rdram, PS2Runtime *runtime, uint32_t serverData, uint32_t rpcNumber,
++                         const void *data, size_t size)
++    {
++        if (!rdram || !runtime || serverData == 0u || size > 0x10000u)
++            return false;
++        const t_SifRpcServerData *sd = reinterpret_cast<const t_SifRpcServerData *>(getMemPtr(rdram, serverData));
++        if (!sd || sd->func == 0u || !runtime->hasFunction(sd->func))
++            return false;
++
++        // Each call gets its own copy of the data, passed as the server function's buffer
++        // argument, so calls queued back to back don't overwrite each other in sd->buf.
++        const uint32_t bufferSize = static_cast<uint32_t>(std::max<size_t>(size, 16u));
++        const uint32_t buffer = runtime->guestMalloc(bufferSize, 64u);
++        if (buffer == 0u)
++            return false;
++        uint8_t *const first = getMemPtr(rdram, buffer);
++        if (!first)
++        {
++            runtime->guestFree(buffer);
++            return false;
++        }
++        std::memset(first, 0, bufferSize);
++        if (data && size != 0u)
++            std::memcpy(first, data, size);
++
++        try
++        {
++            GuestInvocation invocation{};
++            invocation.kind = GuestInvocationKind::SifCommand;
++            invocation.tag = rpcNumber;
++            invocation.context = runtime->cpu();
++            invocation.context.pc = sd->func;
++            SET_GPR_U32(&invocation.context, 4, rpcNumber);
++            SET_GPR_U32(&invocation.context, 5, buffer);
++            SET_GPR_U32(&invocation.context, 6, static_cast<uint32_t>(size));
++            SET_GPR_U32(&invocation.context, 7, 0u);
++            SET_GPR_U32(&invocation.context, 29, 0u);
++            SET_GPR_U32(&invocation.context, 31, 0u);
++            invocation.onComplete = [runtime, buffer](const R5900Context &, R5900Context &)
++            {
++                runtime->guestFree(buffer);
++            };
++            runtime->eeScheduler().queueInvocation(std::move(invocation));
++        }
++        catch (...)
++        {
++            runtime->guestFree(buffer);
++            return false;
++        }
++
++        static uint32_t s_logged = 0u;
++        if (s_logged < 8u)
++        {
++            ++s_logged;
++            std::cerr << "[SifRpc IOP->EE] server=0x" << std::hex << serverData << " func=0x" << sd->func
++                      << " rpc=" << std::dec << rpcNumber << " size=" << size << std::endl;
++        }
++        return true;
++    }
++
+     void SifCheckStatRpc(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+     {
+         uint32_t clientPtr = getRegU32(ctx, 4);
+diff --git a/ps2xRuntime/src/lib/Kernel/Syscalls/RPC.h b/ps2xRuntime/src/lib/Kernel/Syscalls/RPC.h
+index 5e9a446..ef00f74 100644
+--- a/ps2xRuntime/src/lib/Kernel/Syscalls/RPC.h
++++ b/ps2xRuntime/src/lib/Kernel/Syscalls/RPC.h
+@@ -17,4 +17,9 @@ namespace ps2_syscalls
+     void sceSifCallRpc(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+     void sceSifSendCmd(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+     void sceRpcGetPacket(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
++
++    // IOP -> EE RPC (see IopHost::findEeRpcServer / callEeRpc).
++    bool findRpcServerForIop(uint32_t sid, uint32_t &serverData);
++    bool queueRpcFromIop(uint8_t *rdram, PS2Runtime *runtime, uint32_t serverData, uint32_t rpcNumber,
++                         const void *data, size_t size);
+ }
 diff --git a/ps2xRuntime/src/lib/Kernel/Syscalls/Sync.cpp b/ps2xRuntime/src/lib/Kernel/Syscalls/Sync.cpp
 index 33945fc..7476ed8 100644
 --- a/ps2xRuntime/src/lib/Kernel/Syscalls/Sync.cpp
@@ -679,10 +1004,19 @@ index f0ad507..7e8755f 100644
      const GSFrameReg displayFrame1 = decodeDisplayFrame(request.dispfb1);
      const GSFrameReg displayFrame2 = decodeDisplayFrame(request.dispfb2);
 diff --git a/ps2xRuntime/src/lib/gs/gs_frontend.cpp b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
-index 9281d5f..5449210 100644
+index 9281d5f..be9a991 100644
 --- a/ps2xRuntime/src/lib/gs/gs_frontend.cpp
 +++ b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
-@@ -552,6 +552,20 @@ void GS::latchHostPresentationFrame()
+@@ -10,6 +10,8 @@
+ #include <iostream>
+ #include <sstream>
+ 
++std::atomic<uint32_t> g_finishWrites{0u}; // GS FINISH writes, read by ps2_memory.cpp (PS2X_FINISH_LOG)
++
+ namespace
+ {
+     static constexpr uint32_t kHostFrameWidth = 640u;
+@@ -552,6 +554,20 @@ void GS::latchHostPresentationFrame()
      }
  
      const bool hasFrame = static_cast<bool>(frame);
@@ -703,18 +1037,81 @@ index 9281d5f..5449210 100644
      const uint32_t displayFbp = frame.displayFbp;
      const uint32_t sourceFbp = frame.sourceFbp;
      const uint32_t width = frame.width;
+@@ -1477,6 +1493,7 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
+     }
+     case GS_REG_FINISH:
+     {
++        g_finishWrites.fetch_add(1u, std::memory_order_relaxed);
+         if (m_backend)
+         {
+             m_backend->Flush();
+diff --git a/ps2xRuntime/src/lib/ps2_iop_host.cpp b/ps2xRuntime/src/lib/ps2_iop_host.cpp
+index 8d46e03..667db2d 100644
+--- a/ps2xRuntime/src/lib/ps2_iop_host.cpp
++++ b/ps2xRuntime/src/lib/ps2_iop_host.cpp
+@@ -6,6 +6,7 @@
+ #include "runtime/ps2_memory.h"
+ #include "Kernel/Stubs/MemoryCard.h"
+ #include "Kernel/Syscalls/Common.h"
++#include "Kernel/Syscalls/RPC.h"
+ 
+ #include <algorithm>
+ #include <cstring>
+@@ -517,6 +518,19 @@ bool PS2IopHostAdapter::sendSifCommand(uint32_t commandId,
+                                          packetSize);
+ }
+ 
++bool PS2IopHostAdapter::findEeRpcServer(uint32_t sid, uint32_t &serverData)
++{
++    return ps2_syscalls::findRpcServerForIop(sid, serverData);
++}
++
++bool PS2IopHostAdapter::callEeRpc(uint32_t serverData, uint32_t rpcNumber, const void *data, size_t size)
++{
++    uint8_t *const rdram = m_activeRdram
++                               ? m_activeRdram
++                               : m_runtime.memory().getRDRAM();
++    return ps2_syscalls::queueRpcFromIop(rdram, &m_runtime, serverData, rpcNumber, data, size);
++}
++
+ void PS2IopHostAdapter::log(ps2x::iop::LogLevel level, std::string_view message)
+ {
+     const char *prefix = "[ps2xIOP]";
+diff --git a/ps2xRuntime/src/lib/ps2_iop_host.h b/ps2xRuntime/src/lib/ps2_iop_host.h
+index 89d8576..2826d17 100644
+--- a/ps2xRuntime/src/lib/ps2_iop_host.h
++++ b/ps2xRuntime/src/lib/ps2_iop_host.h
+@@ -83,6 +83,8 @@ public:
+                              uint32_t a3,
+                              uint32_t *resultAddress) override;
+     bool sendSifCommand(uint32_t commandId, const void *packet, size_t packetSize) override;
++    bool findEeRpcServer(uint32_t sid, uint32_t &serverData) override;
++    bool callEeRpc(uint32_t serverData, uint32_t rpcNumber, const void *data, size_t size) override;
+ 
+     void log(ps2x::iop::LogLevel level, std::string_view message) override;
+ 
 diff --git a/ps2xRuntime/src/lib/ps2_memory.cpp b/ps2xRuntime/src/lib/ps2_memory.cpp
-index 37b6a4d..394e68f 100644
+index 37b6a4d..496d8ec 100644
 --- a/ps2xRuntime/src/lib/ps2_memory.cpp
 +++ b/ps2xRuntime/src/lib/ps2_memory.cpp
-@@ -1,3 +1,6 @@
+@@ -1,4 +1,16 @@
 +#include <chrono>
 +#include <cstdio>
++#include <functional>
 +#include <cstdlib>
  #include "runtime/ps2_memory.h"
++
++// Reads GS local->host transfer output (set by PS2Runtime; see setGsLocalToHostReader).
++extern std::atomic<uint32_t> g_finishWrites; // gs_frontend.cpp (PS2X_FINISH_LOG)
++static std::function<uint32_t(uint8_t *, uint32_t)> g_gsLocalToHostReader;
++void setGsLocalToHostReader(std::function<uint32_t(uint8_t *, uint32_t)> reader)
++{
++    g_gsLocalToHostReader = std::move(reader);
++}
  #include "runtime/ps2_address.h"
  #include "runtime/gs/gs_frontend.h"
-@@ -331,6 +334,8 @@ bool PS2Memory::initialize(size_t ramSize)
+ #include "ps2_log.h"
+@@ -331,6 +343,8 @@ bool PS2Memory::initialize(size_t ramSize)
      m_path3MaskedFifo.clear();
      m_vif1PendingPath2ImageQwc = 0u;
      m_vif1PendingPath2DirectHl = false;
@@ -723,7 +1120,7 @@ index 37b6a4d..394e68f 100644
      resetEeTimers();
  
      try
-@@ -1231,6 +1236,8 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
+@@ -1231,6 +1245,8 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                  std::memset(&vif1_regs, 0, sizeof(vif1_regs));
                  m_vif1PendingPath2ImageQwc = 0u;
                  m_vif1PendingPath2DirectHl = false;
@@ -732,7 +1129,115 @@ index 37b6a4d..394e68f 100644
                  m_path3Masked = false;
                  if (wasPath3Masked)
                      flushMaskedPath3Packets();
-@@ -1948,6 +1955,65 @@ void PS2Memory::submitGifPacket(GifPathId pathId, const uint8_t *data, uint32_t
+@@ -1311,6 +1327,49 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
+                 return true;
+             }
+ 
++            // VIF1 receiving from the GS: CHCR.DIR = 0 after the EE set BUSDIR (sceDmaRecvN to read
++            // GS memory back after a local->host transfer). Copy the GS output into memory; sending
++            // the destination buffer to VIF1 as VIFcodes instead can leave VIF1 waiting for data
++            // and swallow later packets (Sub Rebellion's graphProc then waits forever for FINISH).
++            if (channelBase == 0x10009000u && (value & 0x1u) == 0u && (gs_regs.busdir & 0x1u) != 0u)
++            {
++                const uint32_t bytes = qwc * 16u;
++                std::vector<uint8_t> data(bytes, 0u);
++                const uint32_t received = g_gsLocalToHostReader && bytes != 0u
++                                              ? g_gsLocalToHostReader(data.data(), bytes)
++                                              : 0u;
++                const bool scratch = isScratchpad(madr);
++                uint8_t *const base = scratch ? m_scratchpad : m_rdram;
++                const uint32_t limit = scratch ? PS2_SCRATCHPAD_SIZE : PS2_RAM_SIZE;
++                uint32_t dst = translateAddress(madr);
++                for (uint32_t done = 0u; done < bytes && base;)
++                {
++                    if (dst >= limit)
++                        dst = 0u;
++                    const uint32_t chunk = std::min(bytes - done, limit - dst);
++                    std::memcpy(base + dst, data.data() + done, chunk);
++                    done += chunk;
++                    dst += chunk;
++                }
++                static uint32_t s_readbackLogs = 0u;
++                if (s_readbackLogs < 4u)
++                {
++                    ++s_readbackLogs;
++                    std::fprintf(stderr, "[vif1-readback] madr=0x%x qwc=%u gsBytes=%u\n", madr, qwc, received);
++                }
++                m_ioRegisters[channelBase + 0x10] = madr + bytes;
++                m_ioRegisters[channelBase + 0x20] = 0u;
++                m_ioRegisters[channelBase + 0x00] = value & ~0x100u;
++                constexpr uint32_t kDStat = 0x1000E010u;
++                uint32_t dstat = m_ioRegisters.count(kDStat) ? m_ioRegisters[kDStat] : 0u;
++                dstat |= 1u << 1u;
++                if (((dstat & 0x3FFu) & ((dstat >> 16) & 0x3FFu)) != 0u)
++                    dstat |= 1u << 31;
++                m_ioRegisters[kDStat] = dstat;
++                queueCompletedDmacCause(1u);
++                return true;
++            }
++
+             if ((channelBase == 0x1000A000u || channelBase == 0x10009000u || channelBase == 0x10008000u) && (m_gsVRAM || channelBase == 0x10008000u))
+             {
+                 auto enqueueTransfer = [&](uint32_t srcAddr, uint32_t qwCount)
+@@ -1344,7 +1403,11 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
+                     uint32_t asr1 = m_ioRegisters[channelBase + 0x50];
+                     uint32_t asp = (chcr >> 4) & 0x3u;
+                     const bool tieEnabled = (chcr & (1u << 7)) != 0u;
+-                    const int kMaxChainTags = 4096;
++                    // Guards against runaway (circular) chains only: a heavy frame can have well over
++                    // 4096 tags (Sub Rebellion's intro: 5.6 MB by tag 4096), and stopping early leaves
++                    // the chain paused on a non-END tag, which games read as a deliberate stop.
++                    const int kMaxChainTags = 262144;
++                    constexpr size_t kMaxChainBytes = 64u * 1024u * 1024u;
+                     std::vector<uint8_t> chainBuf;
+ 
+                     auto appendData = [&](uint32_t srcAddr, uint32_t qwCount)
+@@ -1519,6 +1582,27 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
+                             endChain = true;
+                         if (endChain)
+                             break;
++                        if (chainBuf.size() > kMaxChainBytes)
++                        {
++                            static bool s_warnedBytes = false;
++                            if (!s_warnedBytes)
++                            {
++                                s_warnedBytes = true;
++                                std::fprintf(stderr, "[dma] chain on 0x%x passed %zu bytes; stopping (runaway chain?)\n",
++                                             channelBase, kMaxChainBytes);
++                            }
++                            break;
++                        }
++                    }
++                    if (tagsProcessed >= kMaxChainTags)
++                    {
++                        static bool s_warnedTags = false;
++                        if (!s_warnedTags)
++                        {
++                            s_warnedTags = true;
++                            std::fprintf(stderr, "[dma] chain on 0x%x passed %d tags; stopping (runaway chain?)\n",
++                                         channelBase, kMaxChainTags);
++                        }
+                     }
+ 
+                     m_ioRegisters[channelBase + 0x30] = tagAddr;
+@@ -1526,6 +1610,16 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
+                     m_ioRegisters[channelBase + 0x50] = asr1;
+                     chcr = (chcr & ~(0x3u << 4)) | ((asp & 0x3u) << 4);
+                     chcr = (chcr & 0x0000FFFFu) | (lastTagUpper << 16);
++                    static const char *const s_finishLog = std::getenv("PS2X_FINISH_LOG");
++                    if (s_finishLog && channelBase == 0x10009000u && ((lastTagUpper >> 12) & 0x7u) != 7u)
++                    {
++                        static uint32_t s_stops = 0u;
++                        if (s_stops++ < 60u)
++                            std::fprintf(stderr, "[d1-stop] tag=%04x tadr=0x%x tags=%d bytes=%zu tie=%d csr=%llx finishes=%u pendDirect=%u pendImage=%u\n",
++                                         lastTagUpper, tagAddr, tagsProcessed, chainBuf.size(), tieEnabled ? 1 : 0,
++                                         static_cast<unsigned long long>(gs_regs.csr.load()), g_finishWrites.exchange(0u),
++                                         m_vif1PendingDirectQw, m_vif1PendingPath2ImageQwc);
++                    }
+                     m_ioRegisters[channelBase + 0x00] = chcr;
+ 
+                     if (!chainBuf.empty())
+@@ -1948,6 +2042,65 @@ void PS2Memory::submitGifPacket(GifPathId pathId, const uint8_t *data, uint32_t
      if (!data || sizeBytes < 16)
          return;
  
@@ -799,16 +1304,27 @@ index 37b6a4d..394e68f 100644
      {
          if (m_path3Masked)
 diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
-index 45cb9d2..b93bb73 100644
+index 45cb9d2..a4ade45 100644
 --- a/ps2xRuntime/src/lib/ps2_runtime.cpp
 +++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
-@@ -1,3 +1,5 @@
+@@ -1,3 +1,6 @@
++#include <functional>
 +#include <cstdio>
 +#include <cstdlib>
  #include "ps2_runtime.h"
  #include "ps2_log.h"
  #include "ps2_stubs.h"
-@@ -407,12 +409,41 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
+@@ -27,6 +30,9 @@
+ #include <unordered_map>
+ #include <sstream>
+ 
++// Defined in ps2_memory.cpp: lets VIF1 DMA read GS local->host transfer output.
++void setGsLocalToHostReader(std::function<uint32_t(uint8_t *, uint32_t)> reader); // ps2_memory.cpp
++
+ namespace ps2_stubs
+ {
+     void resetSifState();
+@@ -407,12 +413,41 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
      uint32_t displayFbp = 0u;
      uint32_t sourceFbp = 0u;
      bool usedPreferredDisplaySource = false;
@@ -852,7 +1368,7 @@ index 45cb9d2..b93bb73 100644
      {
          Image blank = GenImageColor(FB_WIDTH, FB_HEIGHT, MAGENTA);
          UpdateTexture(tex, blank.data);
-@@ -444,6 +475,22 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
+@@ -444,6 +479,22 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
          }
          ++s_uploadDebugCount;
      });
@@ -875,6 +1391,15 @@ index 45cb9d2..b93bb73 100644
      s_lastDisplayFbp = displayFbp;
      s_lastSourceFbp = sourceFbp;
      s_lastPreferred = usedPreferredDisplaySource;
+@@ -668,6 +719,8 @@ bool PS2Runtime::syncCoreSubsystems()
+     m_gifArbiter.setProcessPacketFn([this](const uint8_t *data, uint32_t size)
+                                     { m_gs.processGIFPacket(data, size); });
+     m_memory.setGifArbiter(&m_gifArbiter);
++    setGsLocalToHostReader([this](uint8_t *dst, uint32_t maxBytes)
++                           { return m_gs.consumeLocalToHostBytes(dst, maxBytes); });
+     m_memory.setVu1MscalCallback([this](uint32_t startPC, uint32_t top, uint32_t itop)
+                                  {
+                                      R5900Context *cpuContext = m_eeScheduler ? m_eeScheduler->currentContext() : nullptr;
 diff --git a/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp b/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp
 index f872edd..6f0820b 100644
 --- a/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp

@@ -10,12 +10,12 @@ the game's executable) are gitignored and recreated from your own disc.
 ## Status
 
 The recompiled game boots, runs its front end (memory-card prompt, title screen, NEW GAME,
-difficulty select, "NOW LOADING..."), and plays the in-engine 3D intro: textured seabed, rock
-walls, fog, light on the sea floor, fish and a sea turtle swimming past, with the subtitles
-"Fifteen years ago. / two thirds of the earth was submerged / due to movement of the earth's
-crust." It is driven by the keyboard. The three logo movies are skipped by a runtime override
-(`overrides/`), because the PS2's MPEG decoder (IPU) isn't emulated. No sound yet. Next: get
-from the intro into a playable mission.
+difficulty select, "NOW LOADING...") and plays the in-engine 3D intro in full detail: sunken
+skyscrapers, attack submarines, torpedoes, explosions, bubbles, fog, with its subtitles ("Fifteen
+years ago... humankind did not stop fighting amongst themselves."). It runs natively on Windows
+(MinGW cross-build, tested on a Ryzen 7 9800X3D at roughly 7-15 fps in menus and 3-5 fps in 3D)
+and Linux. The logo movies are skipped (no IPU emulation) and there is no sound yet. Next: see
+whether the intro hands over to a playable mission.
 
 | Stage | State |
 |---|---|
@@ -28,7 +28,8 @@ from the intro into a playable mission.
 | Front end (title, menus, loading screen) | Working |
 | Movies (`0\*.DSI`) | Skipped (`overrides/zz_sub_rebellion_overrides.cpp`). Playing them needs IPU emulation; PS2Recomp has none |
 | Sound (`MUS.IRX`, `XA\*.VSD`) | Not reached. SPU2 isn't emulated (register stubs only) |
-| 3D (VU1 microcode) | Working in the intro, after fix 6 |
+| 3D (VU1 microcode) | Working in the intro, after fixes 6 and 11 |
+| IOP sound driver (`MUS.IRX`) talking back to the EE | Working, after fix 9 |
 
 ## The game
 
@@ -96,6 +97,25 @@ Applies to PS2Recomp commit `e563698`. Each fix was needed to get further:
    Upstream's line-doubling stays the default (its test expects it); the Sub Rebellion override
    sets weave.
 
+9. **IOP -> EE RPC** (`ps2xIOP/src/emulator/services/iop_rpc.cpp`, `iop_host.h`,
+   `Kernel/Syscalls/RPC.cpp`, `ps2_iop_host.cpp`). The IOP's `sceSifBindRpc`/`sceSifCallRpc`
+   returned 0 without doing anything, so an IRX could never reach a server the EE registered.
+   `MUS.IRX` binds to the game's sid 0x1011 (`cbFunc`, which feeds `musAdpcmStreamCallback`) in a
+   retry loop that spun forever from boot, eating IOP time. Bind now looks up the EE server and
+   fills `cd->server`; a call copies the sent data into a fresh EE buffer and queues the server
+   function like the existing IOP -> EE SIF-command path. Reply buffers and IOP end functions are
+   not supported yet (logged once).
+10. **VIF1 GS -> EE readback** (`ps2_memory.cpp`). A VIF1 DMA with CHCR.DIR = 0 while GS BUSDIR is
+    set (`sceDmaRecvN` after a local->host transfer) was treated as a send: the destination
+    buffer went to VIF1 as VIFcodes. It now copies the GS transfer output into EE memory and
+    completes the channel.
+11. **DMA chain tag limit** (`ps2_memory.cpp`). Chains stopped silently after 4096 tags. Sub
+    Rebellion's heavier intro frames are larger (5.6 MB by tag 4096), so most of their 3D was
+    never sent (the flat grey scenes), and when a chain stopped on a non-END tag, `graphProc`
+    took it for a readback point and waited forever for the FINISH at the frame's end (the hang
+    at "all were forced to adopt new forms."). The guard is now 262144 tags or 64 MB, with a
+    warning when hit.
+
 Also in the patch, off unless set (the lookups are cached, so they cost nothing when unset):
 - `PS2X_FRAME_DUMP=<dir>`: every 30th presented frame as raw RGBA, display-register probes, and
   at present 150 a dump of GS memory (`vram.bin`) and EE RAM (`eeram.bin`).
@@ -107,6 +127,10 @@ Also in the patch, off unless set (the lookups are cached, so they cost nothing 
   first GIF tag), XGKICK overflows with the packet walked, and GIF packets/bytes per path every
   5 seconds.
 - `PS2X_RUNTIME_LIB_COMPILE_OPTIONS` (CMake): build the runtime library at e.g. `-O2`.
+- `PS2X_IOP_PC_LOG=1`: every 3 s, where IOP threads are when their timeslices end and the most
+  read IOP hardware registers (found the `MUS.IRX` bind loop at 0x5D2F4).
+- `PS2X_FINISH_LOG=1`: each VIF1 DMA chain that stops on a non-END tag, with the GS FINISH
+  writes since the last one, CSR, and pending VIF1 DIRECT/IMAGE state (found fix 11).
 
 PS2Recomp's test suite (built with `-DNDEBUG`, since an existing thread-affinity assert aborts
 it otherwise): 446 passed, 1 failure (`VU0 macro mappings cover all S1/S2 enums`, which can't
@@ -154,23 +178,14 @@ title screen. On a Ryzen 7 9800X3D + RX 9070 XT the first build (single-threaded
 
 ## Next
 
-1. **Intro hang at "all were forced to adopt new forms."** Reproduced in the cloud and on
-   Windows. Before it, the grey scenes ("Peoples, nations, economies...") are not hung: the game
-   thread is pegged, about 40% of it in the VU1 interpreter (`commitReadyPipelines`,
-   `calculatePairReadyCycle`) plus triangle drawing, and the scene renders as flat grey (likely
-   a separate bug, e.g. fog). At the hang the game thread instead spins in the IOP emulator
-   (`IopCpuCore::executeInstruction`, `IopKernel::beginNextReady`): the IOP side, most likely
-   `MUS.IRX` streaming the narration `\XA\AQUAOPEN.VSD`, polls for sound hardware (SPU2) progress
-   that never happens. Next: find the IOP PC it loops at (add an IOP PC sample under an env var),
-   then either fake the SPU2 status it waits for or emulate SPU2 voices/ADPCM (which also brings
-   sound). The intro's subtitles are frame-timed (`demo_sub_main` counts frames), not audio-timed.
-2. **Sound**: SPU2 voices/ADPCM so `MUS.IRX`, `MODHSYN` and the `XA\*.VSD` streams play (the intro
-   opens `\XA\AQUAOPEN.VSD`, its narration).
-3. **Movies, properly**: IPU emulation (MPEG-2 decode plus colour conversion through IPU DMA), or
-   decode the `.DSI` streams on the host. Until then they're skipped.
-4. **Speed**: about 3 frames per second in the cloud container, nearly all in the software GS
-   renderer. GPU rendering would make it full speed.
-5. **Windows testing** on real hardware (see Rebuild for the cross-build).
+1. **Into a mission.** The intro now plays through; see what follows it and whether a mission
+   loads and takes pad input.
+2. **Speed**: the 3D scenes are VU1-interpreter-bound on the game thread (`commitReadyPipelines`,
+   `calculatePairReadyCycle` per cycle), plus triangle drawing. Cheaper VU1 pipeline bookkeeping,
+   then running GS work alongside the EE, then a GPU renderer.
+3. **Sound**: SPU2 voices/ADPCM so `MUS.IRX`, `MODHSYN` and the `XA\*.VSD` streams play. Note
+   `MUS.IRX` calls `modhsyn` export 23 (voice count) constantly, which keeps the IOP busy.
+4. **Movies**: IPU emulation, or decode the `.DSI` streams on the host. Skipped until then.
 
 ## Debugging notes
 
@@ -187,6 +202,11 @@ title screen. On a Ryzen 7 9800X3D + RX 9070 XT the first build (single-threaded
   each is a jump-table entry that loads the routine's address into vi1 and branches to the
   `JR vi1` dispatcher at 0x340.
 - The memory-card "no data" screen is normal for an empty card; no card fix was needed.
+- IRX modules: `tools/irx_calls.py <irx> <library> <ordinal>` lists call sites of an imported
+  function (IRX `.text` loads at the module base printed in the log, e.g. `MUS.IRX` at 0x5CA00).
+- Where the EE is stuck: break on `PS2Runtime::dispatchGuestBranch` in gdb and print `$rcx`
+  (target) and `$r8` (source guest PC) for a few hits; the guest PC is at offset 512 of
+  `R5900Context`.
 - Text problems on the GS side: dump GS memory (`PS2X_FRAME_DUMP`, `vram.bin`) and decode the
   font page with PS2Recomp's own `GSMem` swizzle helpers (call `GSMem::InitLookupTables()`
   first). The swizzle matched hardware; the bug was upstream of the GS, in VIF1 (fix 5).

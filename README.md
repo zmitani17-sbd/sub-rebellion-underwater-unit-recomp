@@ -82,6 +82,20 @@ Applies to PS2Recomp commit `e563698`. Each fix was needed to get further:
    the one-instruction VI branch visibility rule` asserted the old behaviour; it is replaced by
    `JR uses a VI value written by the instruction just before it`.
 
+7. **Software renderer speed** (`gs/gs_cpu_backend.cpp`). Everything (game code, GS, VU1, IOP)
+   ran on one thread, and ~70% of it was the CPU rasterizer. Now: large sprites and triangles
+   (2048+ pixels) are split into 8-row bands across a thread pool (hardware threads minus 2, at
+   most 8; `PS2X_GS_THREADS=<n>` overrides, 1 turns it off), each worker with its own copy of the
+   texture page cache; triangles only test the pixels near each row's span instead of the whole
+   bounding box; bilinear filtering rounds inline instead of calling `lroundf` four times per
+   texel. `tools/gsparity.cpp` draws 400 random large textured/blended/depth-tested primitives
+   and hashes GS memory: the hash is identical with 1, 2, 4 and 8 threads and identical to the
+   unmodified upstream renderer, which takes 1.5x as long single-threaded.
+8. **`PS2X_DEINTERLACE=weave`** shows whole frames in interlaced field mode instead of alternate
+   lines per refresh, which made the picture bounce by a line and halved vertical detail.
+   Upstream's line-doubling stays the default (its test expects it); the Sub Rebellion override
+   sets weave.
+
 Also in the patch, off unless set (the lookups are cached, so they cost nothing when unset):
 - `PS2X_FRAME_DUMP=<dir>`: every 30th presented frame as raw RGBA, display-register probes, and
   at present 150 a dump of GS memory (`vram.bin`) and EE RAM (`eeram.bin`).
@@ -102,7 +116,8 @@ patch too. The patch adds one test (fix 5) and replaces one (fix 6).
 ## Game-specific overrides (`overrides/`)
 
 `zz_sub_rebellion_overrides.cpp` registers a PS2Recomp game override for `SLUS_205.48`. It
-replaces `racMoviePlay` (0x114218) with a stand-in that returns 0 without creating the movie
+sets `PS2X_DEINTERLACE=weave`, makes stdout unbuffered (so a redirected `log.txt` stays
+current), and replaces `racMoviePlay` (0x114218) with a stand-in that returns 0 without creating the movie
 object, which is what the game does for an unknown movie id; no caller uses the result. The
 logo sequence then moves straight on. Set `PS2X_PLAY_MOVIES=1` to turn the skip off.
 `tools/setup_linux.sh` copies `overrides/*.cpp` into `ps2xRuntime/src/runner/`; the `zz_` name
@@ -134,7 +149,8 @@ Windows: `tools/build_windows.sh` cross-compiles a Windows build on Linux with M
 DLLs, `extract_disc.exe` (C++ port of `tools/iso9660.py`, takes `.bin` or `.iso`), `Setup.cmd`
 (unpacks the user's disc image into `game\`), `Play Sub Rebellion.cmd` (logs to `log.txt`) and a
 README with the controls (from `windows/`). Tested under Wine 9: boots, takes input, reaches the
-title screen. An MSVC build should also work but hasn't been tried for this game.
+title screen. On a Ryzen 7 9800X3D + RX 9070 XT the first build (single-threaded renderer) ran at
+1-3 fps and got into the intro ("all were forced to adopt new forms.") after ~10 minutes. An MSVC build should also work but hasn't been tried for this game.
 
 ## Next
 

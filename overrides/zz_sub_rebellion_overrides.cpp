@@ -6,6 +6,7 @@
 #include "ps2_runtime.h"
 #include "ps2_runtime_macros.h"
 
+#include <cstdio>
 #include <cstdlib>
 #include <iostream>
 
@@ -32,6 +33,21 @@ namespace
 
     void applySubRebellion(PS2Runtime &runtime)
     {
+        // Write log output straight through, so log.txt is current while the game runs (the play
+        // script redirects stdout to it, which would otherwise hold output in a buffer).
+        std::setvbuf(stdout, nullptr, _IONBF, 0);
+
+        // The game outputs interlaced video but draws full 448-line frames, so show each frame
+        // whole instead of alternate lines per field (which bounces by a line every refresh).
+        if (!std::getenv("PS2X_DEINTERLACE"))
+        {
+#ifdef _WIN32
+            _putenv("PS2X_DEINTERLACE=weave");
+#else
+            setenv("PS2X_DEINTERLACE", "weave", 0);
+#endif
+        }
+
         if (std::getenv("PS2X_PLAY_MOVIES"))
         {
             return;

@@ -232,7 +232,7 @@ index 33945fc..7476ed8 100644
  
      void iReferSemaStatus(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
 diff --git a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
-index f0ad507..8dd37e7 100644
+index f0ad507..7e8755f 100644
 --- a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
 +++ b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
 @@ -1,3 +1,6 @@
@@ -242,7 +242,209 @@ index f0ad507..8dd37e7 100644
  #include "runtime/gs/gs_cpu_backend.h"
  #include "runtime/gs/ps2_gs_common.h"
  #include "runtime/gs/ps2_gs_psmct16.h"
-@@ -543,8 +546,29 @@ void GSCpuBackend::ResetUnlocked()
+@@ -14,9 +17,178 @@
+ #include <fstream>
+ #include <iostream>
+ #include <stdexcept>
++#include <condition_variable>
++#include <functional>
++#include <mutex>
++#include <thread>
++#include <vector>
+ 
+ using namespace GSInternal;
+ 
++namespace
++{
++    // Texture page cache that SampleTexture uses instead of the backend's own while a row-pool
++    // worker draws part of a primitive (each worker has its own copy).
++    thread_local GSMem::TexturePageCache *t_textureCacheOverride = nullptr;
++    thread_local bool t_isGsRowWorker = false;
++
++    // Splits the rows of large sprites and triangles between threads. Rows are independent in
++    // this rasterizer: each pixel reads and writes only its own framebuffer and Z bytes, so the
++    // image is the same as drawing the rows in order on one thread. Bands are 8 rows aligned to 8
++    // (a swizzled block's height), so two threads don't share a cache line of a page.
++    // PS2X_GS_THREADS=<n> sets the total thread count including the caller (1 turns it off).
++    class GsRowPool
++    {
++    public:
++        static GsRowPool &instance()
++        {
++            static GsRowPool *pool = new GsRowPool(); // never destroyed: no join at process exit
++            return *pool;
++        }
++
++        size_t workerCount() const { return m_threads.size(); }
++
++        // Calls fn(firstRow, lastRow) for every band of [y0, y1]; the caller works too. Returns
++        // false without running anything if another thread is using the pool.
++        bool run(int y0, int y1, const std::function<void(int, int)> &fn)
++        {
++            std::unique_lock<std::mutex> runLock(m_runMutex, std::try_to_lock);
++            if (!runLock.owns_lock())
++                return false;
++            const int base = y0 & ~7;
++            {
++                std::lock_guard<std::mutex> lock(m_mutex);
++                m_fn = &fn;
++                m_y0 = y0;
++                m_y1 = y1;
++                m_base = base;
++                m_bandCount = ((y1 - base) >> 3) + 1;
++                m_nextBand.store(0, std::memory_order_relaxed);
++                m_bandsDone.store(0, std::memory_order_relaxed);
++                ++m_generation;
++            }
++            m_wake.notify_all();
++            workBands(fn);
++            std::unique_lock<std::mutex> lock(m_mutex);
++            m_done.wait(lock, [&]
++                        { return m_bandsDone.load(std::memory_order_acquire) == m_bandCount && m_active == 0; });
++            m_fn = nullptr;
++            return true;
++        }
++
++    private:
++        GsRowPool()
++        {
++            unsigned total = std::thread::hardware_concurrency();
++            total = total > 2u ? std::min(total - 2u, 8u) : 1u;
++            if (const char *env = std::getenv("PS2X_GS_THREADS"); env && *env)
++                total = static_cast<unsigned>(std::clamp(std::atoi(env), 1, 64));
++            for (unsigned i = 1; i < total; ++i)
++            {
++                m_threads.emplace_back([this]
++                                       { workerLoop(); });
++            }
++        }
++
++        void workBands(const std::function<void(int, int)> &fn)
++        {
++            for (;;)
++            {
++                const int band = m_nextBand.fetch_add(1, std::memory_order_relaxed);
++                if (band >= m_bandCount)
++                    return;
++                const int first = std::max(m_y0, m_base + band * 8);
++                const int last = std::min(m_y1, m_base + band * 8 + 7);
++                fn(first, last);
++                m_bandsDone.fetch_add(1, std::memory_order_acq_rel);
++            }
++        }
++
++        void workerLoop()
++        {
++            t_isGsRowWorker = true;
++            uint64_t seen = 0;
++            for (;;)
++            {
++                const std::function<void(int, int)> *fn = nullptr;
++                {
++                    std::unique_lock<std::mutex> lock(m_mutex);
++                    m_wake.wait(lock, [&]
++                                { return m_generation != seen && m_fn != nullptr; });
++                    seen = m_generation;
++                    fn = m_fn;
++                    ++m_active;
++                }
++                workBands(*fn);
++                {
++                    std::lock_guard<std::mutex> lock(m_mutex);
++                    --m_active;
++                }
++                m_done.notify_all();
++            }
++        }
++
++        std::vector<std::thread> m_threads;
++        std::mutex m_runMutex;
++        std::mutex m_mutex;
++        std::condition_variable m_wake;
++        std::condition_variable m_done;
++        uint64_t m_generation = 0;
++        const std::function<void(int, int)> *m_fn = nullptr;
++        int m_y0 = 0;
++        int m_y1 = 0;
++        int m_base = 0;
++        int m_bandCount = 0;
++        int m_active = 0;
++        std::atomic<int> m_nextBand{0};
++        std::atomic<int> m_bandsDone{0};
++    };
++
++    constexpr uint64_t kParallelMinPixels = 2048u;
++    std::atomic<uint64_t> g_rowJobCounter{0};
++
++    // Runs rowFn(firstRow, lastRow) over [y0, y1], split between the row pool's threads when the
++    // primitive is big enough to be worth it.
++    template <typename RowFn>
++    void runPrimitiveRows(const GSMem::TexturePageCache &mainCache, int y0, int y1, uint64_t pixels, RowFn &&rowFn)
++    {
++        if (y1 < y0)
++            return;
++        GsRowPool &pool = GsRowPool::instance();
++        if (pool.workerCount() == 0u || pixels < kParallelMinPixels || (y1 - y0) < 15 || t_isGsRowWorker)
++        {
++            rowFn(y0, y1);
++            return;
++        }
++        // Workers start from the caller's texture page cache, so they see the same (possibly not
++        // yet flushed) texture page the caller would.
++        thread_local GSMem::TexturePageCache t_snapshot;
++        t_snapshot = mainCache;
++        const GSMem::TexturePageCache &snapshot = t_snapshot;
++        const uint64_t job = g_rowJobCounter.fetch_add(1, std::memory_order_relaxed) + 1u;
++        const std::function<void(int, int)> band = [&](int first, int last)
++        {
++            if (!t_isGsRowWorker)
++            {
++                rowFn(first, last);
++                return;
++            }
++            thread_local GSMem::TexturePageCache workerCache;
++            thread_local uint64_t workerCacheJob = 0;
++            if (workerCacheJob != job)
++            {
++                workerCache = snapshot;
++                workerCacheJob = job;
++            }
++            t_textureCacheOverride = &workerCache;
++            rowFn(first, last);
++            t_textureCacheOverride = nullptr;
++        };
++        if (!pool.run(y0, y1, band))
++            rowFn(y0, y1);
++    }
++}
++
+ namespace
+ {
+     float fabsQ(float q)
+@@ -292,11 +464,21 @@ namespace
+         return psm == GS_PSM_T8 || psm == GS_PSM_T8H;
+     }
+ 
++    // Same result as std::lround (halves away from zero) for |value| < 2^23, without the libm
++    // call: GCC doesn't inline lroundf, and this runs four times per filtered texel.
++    inline int roundHalfAwayFromZero(float value)
++    {
++        const float magnitude = value < 0.0f ? -value : value;
++        const int whole = static_cast<int>(magnitude);
++        const int rounded = whole + ((magnitude - static_cast<float>(whole)) >= 0.5f ? 1 : 0);
++        return value < 0.0f ? -rounded : rounded;
++    }
++
+     uint8_t lerpChannel(uint8_t c00, uint8_t c10, uint8_t c01, uint8_t c11, float fx, float fy)
+     {
+         const float top = static_cast<float>(c00) + (static_cast<float>(c10) - static_cast<float>(c00)) * fx;
+         const float bottom = static_cast<float>(c01) + (static_cast<float>(c11) - static_cast<float>(c01)) * fx;
+-        return clampU8(static_cast<int>(std::lround(top + (bottom - top) * fy)));
++        return clampU8(roundHalfAwayFromZero(top + (bottom - top) * fy));
+     }
+ }
+ 
+@@ -543,8 +725,29 @@ void GSCpuBackend::ResetUnlocked()
      m_localToHostReadPos = 0u;
  }
  
@@ -272,7 +474,17 @@ index f0ad507..8dd37e7 100644
      std::lock_guard<std::mutex> lock(m_mutex);
      if (!m_vram || batch.vertexCount == 0u)
          return;
-@@ -1227,6 +1251,23 @@ void GSCpuBackend::DrawSprite(const GSPrimitiveBatch &batch)
+@@ -670,7 +873,8 @@ uint32_t GSCpuBackend::ReadTextureVramUnlocked(uint32_t psm, uint32_t base, uint
+     if (!m_vram)
+         return 0u;
+ 
+-    return GSMem::ReadTexture(m_texturePageCache, m_vram, psm, base, bw, x, y);
++    GSMem::TexturePageCache &cache = t_textureCacheOverride ? *t_textureCacheOverride : m_texturePageCache;
++    return GSMem::ReadTexture(cache, m_vram, psm, base, bw, x, y);
+ }
+ 
+ void GSCpuBackend::WriteVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y, uint32_t value)
+@@ -1227,6 +1431,23 @@ void GSCpuBackend::DrawSprite(const GSPrimitiveBatch &batch)
              v1f = (v1.t / q1) * static_cast<float>(texH);
          }
  
@@ -296,7 +508,100 @@ index f0ad507..8dd37e7 100644
          float spriteW = static_cast<float>(spanX);
          float spriteH = static_cast<float>(spanY);
          if (spriteW < 1.0f)
-@@ -1463,6 +1504,9 @@ void GSCpuBackend::DrawLine(const GSPrimitiveBatch &batch)
+@@ -1234,7 +1455,10 @@ void GSCpuBackend::DrawSprite(const GSPrimitiveBatch &batch)
+         if (spriteH < 1.0f)
+             spriteH = 1.0f;
+ 
+-        for (int y = drawY0; y <= drawY1; ++y)
++        const uint64_t spritePixels = static_cast<uint64_t>(drawX1 - drawX0 + 1) * static_cast<uint64_t>(drawY1 - drawY0 + 1);
++        runPrimitiveRows(m_texturePageCache, drawY0, drawY1, spritePixels, [&](int rowFirst, int rowLast)
++        {
++        for (int y = rowFirst; y <= rowLast; ++y)
+         {
+             float ty = (static_cast<float>(y - unclippedY0) + 0.5f) / spriteH;
+             float texVf = v0f + (v1f - v0f) * ty;
+@@ -1266,12 +1490,17 @@ void GSCpuBackend::DrawSprite(const GSPrimitiveBatch &batch)
+                 WritePixel(state, x, y, z1, color.r, color.g, color.b, color.a, v1.fog);
+             }
+         }
++        });
+     }
+     else
+     {
+-        for (int y = drawY0; y <= drawY1; ++y)
+-            for (int x = drawX0; x <= drawX1; ++x)
+-                WritePixel(state, x, y, z1, r, g, b, a, v1.fog);
++        const uint64_t spritePixels = static_cast<uint64_t>(drawX1 - drawX0 + 1) * static_cast<uint64_t>(drawY1 - drawY0 + 1);
++        runPrimitiveRows(m_texturePageCache, drawY0, drawY1, spritePixels, [&](int rowFirst, int rowLast)
++        {
++            for (int y = rowFirst; y <= rowLast; ++y)
++                for (int x = drawX0; x <= drawX1; ++x)
++                    WritePixel(state, x, y, z1, r, g, b, a, v1.fog);
++        });
+     }
+ }
+ 
+@@ -1311,10 +1540,49 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch)
+     const float invAbsDenom = 1.0f / std::fabs(denom);
+     constexpr float kEdgeEpsilon = 1.0e-4f;
+ 
+-    for (int y = minY; y <= maxY; ++y)
++    // Each weight is linear in px along a row: w = slope * px + offset(py). The per-row x range
++    // where all three can pass the test below is narrowed with two pixels of slack on each side,
++    // and the per-pixel test still decides, so the covered pixels are exactly the same.
++    const double edgeScale = static_cast<double>(winding) * static_cast<double>(invAbsDenom);
++    const double slope0 = static_cast<double>(fy1 - fy2) * edgeScale;
++    const double slope1 = static_cast<double>(fy2 - fy0) * edgeScale;
++    const double slope2 = -(slope0 + slope1);
++    auto rowSpan = [&](float py, int &spanFirst, int &spanLast)
++    {
++        const double offset0 = (static_cast<double>(fy1 - fy2) * -static_cast<double>(fx2) +
++                                static_cast<double>(fx2 - fx1) * (static_cast<double>(py) - fy2)) * edgeScale;
++        const double offset1 = (static_cast<double>(fy2 - fy0) * -static_cast<double>(fx2) +
++                                static_cast<double>(fx0 - fx2) * (static_cast<double>(py) - fy2)) * edgeScale;
++        const double offset2 = 1.0 - offset0 - offset1;
++        double lo = -1.0e30, hi = 1.0e30;
++        const double slopes[3] = {slope0, slope1, slope2};
++        const double offsets[3] = {offset0, offset1, offset2};
++        for (int i = 0; i < 3; ++i)
++        {
++            if (slopes[i] > 1.0e-9)
++                lo = std::max(lo, (-static_cast<double>(kEdgeEpsilon) - offsets[i]) / slopes[i]);
++            else if (slopes[i] < -1.0e-9)
++                hi = std::min(hi, (-static_cast<double>(kEdgeEpsilon) - offsets[i]) / slopes[i]);
++        }
++        spanFirst = minX;
++        spanLast = maxX;
++        if (lo > -1.0e29)
++            spanFirst = static_cast<int>(std::max<double>(minX, std::floor(lo - 0.5) - 2.0));
++        if (hi < 1.0e29)
++            spanLast = static_cast<int>(std::min<double>(maxX, std::ceil(hi - 0.5) + 2.0));
++    };
++
++    const uint64_t boundsPixels = static_cast<uint64_t>(std::max(0, maxX - minX + 1)) *
++                                  static_cast<uint64_t>(std::max(0, maxY - minY + 1));
++    runPrimitiveRows(m_texturePageCache, minY, maxY, boundsPixels, [&](int rowFirst, int rowLast)
++    {
++    for (int y = rowFirst; y <= rowLast; ++y)
+     {
+         float py = static_cast<float>(y) + 0.5f;
+-        for (int x = minX; x <= maxX; ++x)
++        int spanFirst = minX;
++        int spanLast = maxX;
++        rowSpan(py, spanFirst, spanLast);
++        for (int x = spanFirst; x <= spanLast; ++x)
+         {
+             float px = static_cast<float>(x) + 0.5f;
+ 
+@@ -1391,6 +1659,7 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch)
+             WritePixel(state, x, y, static_cast<u32>(z + 0.5), r, g, b, a, fog);
+         }
+     }
++    });
+ }
+ 
+ void GSCpuBackend::DrawLine(const GSPrimitiveBatch &batch)
+@@ -1463,6 +1732,9 @@ void GSCpuBackend::DrawLine(const GSPrimitiveBatch &batch)
  void GSCpuBackend::BeginTransfer(const GSTransferCommand &command)
  {
      std::lock_guard<std::mutex> lock(m_mutex);
@@ -306,7 +611,7 @@ index f0ad507..8dd37e7 100644
      m_transfer = command;
      m_transferState.x = command.trxpos.dsax;
      m_transferState.y = command.trxpos.dsay;
-@@ -1471,6 +1515,22 @@ void GSCpuBackend::BeginTransfer(const GSTransferCommand &command)
+@@ -1471,6 +1743,22 @@ void GSCpuBackend::BeginTransfer(const GSTransferCommand &command)
      m_transferState.direction = command.direction;
      m_transferState.localToHostPendingBytes = 0u;
  
@@ -329,7 +634,7 @@ index f0ad507..8dd37e7 100644
      if (command.direction == 2u)
          PerformLocalToLocalTransfer();
      else if (command.direction == 1u)
-@@ -1847,10 +1907,26 @@ PresentationFrame GSCpuBackend::Present(const GSPresentationRequest &request)
+@@ -1847,10 +2135,26 @@ PresentationFrame GSCpuBackend::Present(const GSPresentationRequest &request)
  {
      // Snapshot local memory under the backend lock, then perform the expensive
      // display conversion without holding the producer-side raster lock.
@@ -356,6 +661,23 @@ index f0ad507..8dd37e7 100644
  
      thread_local GSCpuBackend snapshotBackend;
      snapshotBackend.Initialize(snapshot.data(), static_cast<uint32_t>(snapshot.size()));
+@@ -1862,7 +2166,15 @@ PresentationFrame GSCpuBackend::PresentFromLocalMemory(const GSPresentationReque
+     PresentationFrame result{};
+     const GSPmodeState pmode = decodePmode(request.pmode);
+     const GSSmode2State smode2 = decodeSMode2(request.smode2);
+-    const bool fieldMode = smode2.interlaced && !smode2.frameMode;
++    // PS2X_DEINTERLACE=weave shows the whole frame instead of alternate lines per field ("bob").
++    // Bob makes a progressive display jump by a line every refresh, and halves vertical detail,
++    // for games that draw full-height frames in this mode (Sub Rebellion's override sets weave).
++    static const bool s_weaveDeinterlace = []
++    {
++        const char *mode = std::getenv("PS2X_DEINTERLACE");
++        return mode && std::strcmp(mode, "weave") == 0;
++    }();
++    const bool fieldMode = !s_weaveDeinterlace && smode2.interlaced && !smode2.frameMode;
+     const bool oddField = (request.vsyncTick & 1ull) != 0ull;
+     const GSFrameReg displayFrame1 = decodeDisplayFrame(request.dispfb1);
+     const GSFrameReg displayFrame2 = decodeDisplayFrame(request.dispfb2);
 diff --git a/ps2xRuntime/src/lib/gs/gs_frontend.cpp b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
 index 9281d5f..5449210 100644
 --- a/ps2xRuntime/src/lib/gs/gs_frontend.cpp

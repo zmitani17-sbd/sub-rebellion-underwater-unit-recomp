@@ -33,8 +33,21 @@ index 420f053..a2759c3 100644
          }
      }
  
+diff --git a/ps2xRuntime/include/runtime/ps2_memory.h b/ps2xRuntime/include/runtime/ps2_memory.h
+index ea86a9c..ef26cdd 100644
+--- a/ps2xRuntime/include/runtime/ps2_memory.h
++++ b/ps2xRuntime/include/runtime/ps2_memory.h
+@@ -409,6 +409,8 @@ public:
+     bool m_path3Masked = false;
+     uint32_t m_vif1PendingPath2ImageQwc = 0u;
+     bool m_vif1PendingPath2DirectHl = false;
++    uint32_t m_vif1PendingDirectQw = 0u;   // DIRECT/DIRECTHL data still to come from the next buffer
++    bool m_vif1PendingDirectIsHl = false;
+     std::vector<std::vector<uint8_t>> m_path3MaskedFifo;
+ 
+     struct PendingTransfer
 diff --git a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
-index c5e31c4..0e4382a 100644
+index c5e31c4..76aae8f 100644
 --- a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
 +++ b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
 @@ -1,3 +1,5 @@
@@ -43,7 +56,7 @@ index c5e31c4..0e4382a 100644
  #include "runtime/ee_scheduler.h"
  
  #include "ps2_log.h"
-@@ -173,6 +175,31 @@ void EeScheduler::run()
+@@ -173,6 +175,32 @@ void EeScheduler::run()
                  copyMainContextToRuntime();
                  publishIdleDebugContext();
                  publishSnapshot();
@@ -51,7 +64,8 @@ index c5e31c4..0e4382a 100644
 +                    // Feasibility-check diagnostic: who is every guest thread waiting on?
 +                    static auto lastDump = std::chrono::steady_clock::now();
 +                    const auto now = std::chrono::steady_clock::now();
-+                    if (std::getenv("PS2X_IDLE_DUMP") && now - lastDump > std::chrono::seconds(5))
++                    static const char *const s_env7 = std::getenv("PS2X_IDLE_DUMP");
++                    if (s_env7 && now - lastDump > std::chrono::seconds(5))
 +                    {
 +                        lastDump = now;
 +                        const EeKernelSnapshot s = snapshot();
@@ -75,7 +89,7 @@ index c5e31c4..0e4382a 100644
                  waitForEvent();
                  continue;
              }
-@@ -1237,25 +1264,46 @@ int EeScheduler::setIrqHandlerEnabled(bool dmac, int id, bool enabled)
+@@ -1237,25 +1265,47 @@ int EeScheduler::setIrqHandlerEnabled(bool dmac, int id, bool enabled)
  int EeScheduler::setIrqCauseEnabled(bool dmac, uint32_t cause, bool enabled)
  {
      assertExecutor();
@@ -108,7 +122,8 @@ index c5e31c4..0e4382a 100644
  {
      assertExecutor();
      const uint32_t mask = dmac ? m_enabledDmacMask : m_enabledIntcMask;
-+    if (std::getenv("PS2X_IDLE_DUMP") && !dmac && cause == 2u)
++    static const char *const s_env8 = std::getenv("PS2X_IDLE_DUMP");
++    if (s_env8 && !dmac && cause == 2u)
 +    {
 +        static int dumps = 0;
 +        if (dumps < 6 || (dumps % 300) == 0)
@@ -184,15 +199,141 @@ index 33945fc..7476ed8 100644
      }
  
      void iReferSemaStatus(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+diff --git a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+index f0ad507..8dd37e7 100644
+--- a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+@@ -1,3 +1,6 @@
++#include <cstdlib>
++#include <string>
++#include <set>
+ #include "runtime/gs/gs_cpu_backend.h"
+ #include "runtime/gs/ps2_gs_common.h"
+ #include "runtime/gs/ps2_gs_psmct16.h"
+@@ -543,8 +546,29 @@ void GSCpuBackend::ResetUnlocked()
+     m_localToHostReadPos = 0u;
+ }
+ 
++namespace
++{
++    // Diagnostic: presents counted for PS2X_SEQ_LOG (log GS operations in a short window).
++    std::atomic<uint32_t> g_seqPresent{0};
++    bool seqLogActive()
++    {
++        static const bool enabled = std::getenv("PS2X_SEQ_LOG") != nullptr;
++        const uint32_t n = g_seqPresent.load(std::memory_order_relaxed);
++        return enabled && n >= 140u && n <= 141u;
++    }
++}
++
+ void GSCpuBackend::Submit(const GSPrimitiveBatch &batch)
+ {
++    if (seqLogActive() && batch.vertexCount != 0u)
++    {
++        const auto &c = batch.state.context;
++        std::fprintf(stderr, "[seq %u] DRAW prim=%u n=%u fbp=%u fbw=%u fpsm=%u fbmsk=%08x tme=%u tbp=%u tpsm=%u xy0=(%.0f,%.0f) xy1=(%.0f,%.0f)\n",
++                     g_seqPresent.load(), static_cast<unsigned>(batch.state.prim.type), static_cast<unsigned>(batch.vertexCount), c.frame.fbp, c.frame.fbw, c.frame.psm,
++                     c.frame.fbmsk, batch.state.prim.tme ? 1u : 0u, c.tex0.tbp0, c.tex0.psm,
++                     static_cast<double>(batch.vertices[0].x), static_cast<double>(batch.vertices[0].y),
++                     static_cast<double>(batch.vertices[batch.vertexCount - 1].x), static_cast<double>(batch.vertices[batch.vertexCount - 1].y));
++    }
+     std::lock_guard<std::mutex> lock(m_mutex);
+     if (!m_vram || batch.vertexCount == 0u)
+         return;
+@@ -1227,6 +1251,23 @@ void GSCpuBackend::DrawSprite(const GSPrimitiveBatch &batch)
+             v1f = (v1.t / q1) * static_cast<float>(texH);
+         }
+ 
++        static const char *const s_env1 = std::getenv("PS2X_SPRITE_LOG");
++        if (s_env1)
++        {
++            // Diagnostic: one line per distinct textured-sprite setup.
++            static std::set<std::string> s_seen;
++            char key[256];
++            std::snprintf(key, sizeof(key),
++                          "psm=%u cpsm=%u csm=%u csa=%u tbp=%u tbw=%u tw=%u th=%u cbp=%u fst=%u lin=%d tfx=%u tcc=%u w=%d h=%d",
++                          tex.psm, tex.cpsm, tex.csm, tex.csa, tex.tbp0, tex.tbw, tex.tw, tex.th, tex.cbp,
++                          state.prim.fst ? 1u : 0u, state.linearFilter ? 1 : 0, tex.tfx, tex.tcc, spanX, spanY);
++            if (s_seen.size() < 200 && s_seen.insert(key).second)
++                std::fprintf(stderr, "[sprite] %s xy=(%d,%d)-(%d,%d) uv=(%.2f,%.2f)-(%.2f,%.2f) raw=(%u,%u)-(%u,%u) vx=(%.3f,%.3f)-(%.3f,%.3f)\n",
++                             key, unclippedX0, unclippedY0, unclippedX1, unclippedY1, u0f, v0f, u1f, v1f,
++                             v0.u, v0.v, v1.u, v1.v, static_cast<double>(v0.x), static_cast<double>(v0.y),
++                             static_cast<double>(v1.x), static_cast<double>(v1.y));
++        }
++
+         float spriteW = static_cast<float>(spanX);
+         float spriteH = static_cast<float>(spanY);
+         if (spriteW < 1.0f)
+@@ -1463,6 +1504,9 @@ void GSCpuBackend::DrawLine(const GSPrimitiveBatch &batch)
+ void GSCpuBackend::BeginTransfer(const GSTransferCommand &command)
+ {
+     std::lock_guard<std::mutex> lock(m_mutex);
++    if (seqLogActive() && m_transferState.direction == 0u && m_transferState.totalPixels != 0u)
++        std::fprintf(stderr, "[seq %u] XFER-END prev dbp=%u copied=%u/%u px\n", g_seqPresent.load(),
++                     m_transfer.bitbltbuf.dbp, m_transferState.copiedPixels, m_transferState.totalPixels);
+     m_transfer = command;
+     m_transferState.x = command.trxpos.dsax;
+     m_transferState.y = command.trxpos.dsay;
+@@ -1471,6 +1515,22 @@ void GSCpuBackend::BeginTransfer(const GSTransferCommand &command)
+     m_transferState.direction = command.direction;
+     m_transferState.localToHostPendingBytes = 0u;
+ 
++    static const char *const s_env2 = std::getenv("PS2X_SPRITE_LOG");
++    if (s_env2)
++    {
++        static std::set<std::string> s_seenXfer;
++        char key[192];
++        std::snprintf(key, sizeof(key), "dir=%u dbp=%u dbw=%u dpsm=%u sbp=%u sbw=%u spsm=%u rr=%ux%u",
++                      command.direction, command.bitbltbuf.dbp, command.bitbltbuf.dbw, command.bitbltbuf.dpsm,
++                      command.bitbltbuf.sbp, command.bitbltbuf.sbw, command.bitbltbuf.spsm,
++                      command.trxreg.rrw, command.trxreg.rrh);
++        if (s_seenXfer.size() < 200 && s_seenXfer.insert(key).second)
++            std::fprintf(stderr, "[xfer] %s dsa=(%u,%u)\n", key, command.trxpos.dsax, command.trxpos.dsay);
++    }
++
++    if (seqLogActive())
++        std::fprintf(stderr, "[seq %u] XFER dir=%u dbp=%u dbw=%u dpsm=%u rr=%ux%u\n", g_seqPresent.load(), command.direction,
++                     command.bitbltbuf.dbp, command.bitbltbuf.dbw, command.bitbltbuf.dpsm, command.trxreg.rrw, command.trxreg.rrh);
+     if (command.direction == 2u)
+         PerformLocalToLocalTransfer();
+     else if (command.direction == 1u)
+@@ -1847,10 +1907,26 @@ PresentationFrame GSCpuBackend::Present(const GSPresentationRequest &request)
+ {
+     // Snapshot local memory under the backend lock, then perform the expensive
+     // display conversion without holding the producer-side raster lock.
++    g_seqPresent.fetch_add(1u, std::memory_order_relaxed);
+     thread_local std::vector<uint8_t> snapshot;
+     SnapshotVram(snapshot);
+     if (snapshot.empty())
+         return {};
++    static const char *const s_env3 = std::getenv("PS2X_FRAME_DUMP");
++    if (const char *dumpDir = s_env3; dumpDir && *dumpDir)
++    {
++        // Diagnostic: write the whole of GS local memory once, ~10 s into the run.
++        static uint32_t s_presents = 0u;
++        if (++s_presents == 150u)
++        {
++            const std::string path = std::string(dumpDir) + "/vram.bin";
++            if (FILE *f = std::fopen(path.c_str(), "wb"))
++            {
++                std::fwrite(snapshot.data(), 1, snapshot.size(), f);
++                std::fclose(f);
++            }
++        }
++    }
+ 
+     thread_local GSCpuBackend snapshotBackend;
+     snapshotBackend.Initialize(snapshot.data(), static_cast<uint32_t>(snapshot.size()));
 diff --git a/ps2xRuntime/src/lib/gs/gs_frontend.cpp b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
-index 9281d5f..1e482e5 100644
+index 9281d5f..5449210 100644
 --- a/ps2xRuntime/src/lib/gs/gs_frontend.cpp
 +++ b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
-@@ -552,6 +552,19 @@ void GS::latchHostPresentationFrame()
+@@ -552,6 +552,20 @@ void GS::latchHostPresentationFrame()
      }
  
      const bool hasFrame = static_cast<bool>(frame);
-+    if (std::getenv("PS2X_FRAME_DUMP"))
++    static const char *const s_env10 = std::getenv("PS2X_FRAME_DUMP");
++    if (s_env10)
 +    {
 +        static uint32_t s_latchProbe = 0u;
 +        if ((s_latchProbe++ % 60u) == 0u)
@@ -208,8 +349,80 @@ index 9281d5f..1e482e5 100644
      const uint32_t displayFbp = frame.displayFbp;
      const uint32_t sourceFbp = frame.sourceFbp;
      const uint32_t width = frame.width;
+diff --git a/ps2xRuntime/src/lib/ps2_memory.cpp b/ps2xRuntime/src/lib/ps2_memory.cpp
+index 37b6a4d..f5e913a 100644
+--- a/ps2xRuntime/src/lib/ps2_memory.cpp
++++ b/ps2xRuntime/src/lib/ps2_memory.cpp
+@@ -1,3 +1,5 @@
++#include <cstdio>
++#include <cstdlib>
+ #include "runtime/ps2_memory.h"
+ #include "runtime/ps2_address.h"
+ #include "runtime/gs/gs_frontend.h"
+@@ -331,6 +333,8 @@ bool PS2Memory::initialize(size_t ramSize)
+     m_path3MaskedFifo.clear();
+     m_vif1PendingPath2ImageQwc = 0u;
+     m_vif1PendingPath2DirectHl = false;
++    m_vif1PendingDirectQw = 0u;
++    m_vif1PendingDirectIsHl = false;
+     resetEeTimers();
+ 
+     try
+@@ -1231,6 +1235,8 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
+                 std::memset(&vif1_regs, 0, sizeof(vif1_regs));
+                 m_vif1PendingPath2ImageQwc = 0u;
+                 m_vif1PendingPath2DirectHl = false;
++                m_vif1PendingDirectQw = 0u;
++                m_vif1PendingDirectIsHl = false;
+                 m_path3Masked = false;
+                 if (wasPath3Masked)
+                     flushMaskedPath3Packets();
+@@ -1948,6 +1954,43 @@ void PS2Memory::submitGifPacket(GifPathId pathId, const uint8_t *data, uint32_t
+     if (!data || sizeBytes < 16)
+         return;
+ 
++    static const char *const s_env9 = std::getenv("PS2X_SEQ_LOG");
++    if (s_env9)
++    {
++        // Diagnostic: a window of GIF submissions with their path and first tag.
++        static uint32_t s_gifSeq = 0u;
++        const uint32_t n = s_gifSeq++;
++        if ((n >= 3000u && n < 3400u) || (n % 5000u) == 0u)
++        {
++            uint64_t tagLo = 0, tagHi = 0;
++            std::memcpy(&tagLo, data, 8);
++            std::memcpy(&tagHi, data + 8, 8);
++            const unsigned flg = static_cast<unsigned>((tagLo >> 58) & 3u);
++            const unsigned nloop = static_cast<unsigned>(tagLo & 0x7FFFu);
++            uint64_t hash = 1469598103934665603ull;
++            for (uint32_t i = 16; i < sizeBytes; ++i)
++                hash = (hash ^ data[i]) * 1099511628211ull;
++            uint32_t nonzero = 0;
++            for (uint32_t i = 16; i < sizeBytes; ++i)
++                nonzero += data[i] != 0;
++            std::fprintf(stderr, "[gifhash %u] %016llx nonzero=%u\n", n, static_cast<unsigned long long>(hash), nonzero);
++            static bool s_dumpedPayload = false;
++            const char *dumpDir = std::getenv("PS2X_FRAME_DUMP");
++            if (!s_dumpedPayload && dumpDir && nonzero > 100u && ((tagLo >> 58) & 3u) == 2u)
++            {
++                s_dumpedPayload = true;
++                if (FILE *f = std::fopen((std::string(dumpDir) + "/image_payload.bin").c_str(), "wb"))
++                {
++                    std::fwrite(data + 16, 1, sizeBytes - 16, f);
++                    std::fclose(f);
++                }
++            }
++            std::fprintf(stderr, "[gif %u] path=%u size=%u drain=%d masked=%d flg=%u nloop=%u regs=%016llx\n", n,
++                         static_cast<unsigned>(pathId), sizeBytes, drainImmediately ? 1 : 0, m_path3Masked ? 1 : 0, flg, nloop,
++                         static_cast<unsigned long long>(tagHi));
++        }
++    }
++
+     if (pathId == GifPathId::Path3)
+     {
+         if (m_path3Masked)
 diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
-index 45cb9d2..0fa2740 100644
+index 45cb9d2..b93bb73 100644
 --- a/ps2xRuntime/src/lib/ps2_runtime.cpp
 +++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
 @@ -1,3 +1,5 @@
@@ -218,7 +431,7 @@ index 45cb9d2..0fa2740 100644
  #include "ps2_runtime.h"
  #include "ps2_log.h"
  #include "ps2_stubs.h"
-@@ -407,12 +409,25 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
+@@ -407,12 +409,41 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
      uint32_t displayFbp = 0u;
      uint32_t sourceFbp = 0u;
      bool usedPreferredDisplaySource = false;
@@ -230,7 +443,23 @@ index 45cb9d2..0fa2740 100644
                                                     &sourceFbp,
 -                                                   &usedPreferredDisplaySource))
 +                                                   &usedPreferredDisplaySource);
-+    if (std::getenv("PS2X_FRAME_DUMP"))
++    static const char *const s_env4 = std::getenv("PS2X_FRAME_DUMP");
++    if (const char *ramDumpDir = s_env4; ramDumpDir && *ramDumpDir)
++    {
++        // Diagnostic: EE RAM once, alongside the GS VRAM dump.
++        static uint32_t s_ramFrames = 0u;
++        if (++s_ramFrames == 150u)
++        {
++            const std::string path = std::string(ramDumpDir) + "/eeram.bin";
++            if (FILE *f = std::fopen(path.c_str(), "wb"))
++            {
++                std::fwrite(rt->memory().getRDRAM(), 1, PS2_RAM_SIZE, f);
++                std::fclose(f);
++            }
++        }
++    }
++    static const char *const s_env5 = std::getenv("PS2X_FRAME_DUMP");
++    if (s_env5)
 +    {
 +        static uint32_t s_probe = 0u;
 +        if ((s_probe++ % 60u) == 0u)
@@ -246,11 +475,12 @@ index 45cb9d2..0fa2740 100644
      {
          Image blank = GenImageColor(FB_WIDTH, FB_HEIGHT, MAGENTA);
          UpdateTexture(tex, blank.data);
-@@ -444,6 +459,21 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
+@@ -444,6 +475,22 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
          }
          ++s_uploadDebugCount;
      });
-+    if (const char *dumpDir = std::getenv("PS2X_FRAME_DUMP"); dumpDir && *dumpDir && !s_scratch.empty())
++    static const char *const s_env6 = std::getenv("PS2X_FRAME_DUMP");
++    if (const char *dumpDir = s_env6; dumpDir && *dumpDir && !s_scratch.empty())
 +    {
 +        // Feasibility-check diagnostic: write every 30th presented frame as raw RGBA.
 +        static uint32_t s_dumpCounter = 0u;
@@ -268,6 +498,226 @@ index 45cb9d2..0fa2740 100644
      s_lastDisplayFbp = displayFbp;
      s_lastSourceFbp = sourceFbp;
      s_lastPreferred = usedPreferredDisplaySource;
+diff --git a/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp b/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp
+index f872edd..f4567b5 100644
+--- a/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp
++++ b/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp
+@@ -30,6 +30,28 @@ namespace
+ {
+     constexpr uint8_t kGifFmtImage = 2u;
+ 
++    // True when the VIFcodes at pos are a DIRECT/DIRECTHL, after at most a few NOP, FLUSH* or
++    // MSKPATH3 codes. That is how hardware sees them, and their data continues an open GIF IMAGE.
++    bool directContinuesImageAt(const uint8_t *data, uint32_t sizeBytes, uint32_t pos)
++    {
++        for (uint32_t i = 0; i < 4u && pos + 4u <= sizeBytes; ++i, pos += 4u)
++        {
++            uint32_t word;
++            std::memcpy(&word, data + pos, sizeof(word));
++            const uint8_t opcode = static_cast<uint8_t>((word >> 24) & 0x7Fu);
++            if (opcode == VIF_DIRECT || opcode == VIF_DIRECTHL)
++            {
++                return true;
++            }
++            if (opcode != VIF_NOP && opcode != VIF_FLUSHE && opcode != VIF_FLUSH &&
++                opcode != VIF_FLUSHA && opcode != VIF_MSKPATH3)
++            {
++                return false;
++            }
++        }
++        return false;
++    }
++
+     uint32_t pendingGifImageQwc(const uint8_t *data, uint32_t sizeBytes)
+     {
+         if (!data || sizeBytes < 16u)
+@@ -302,9 +324,51 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
+ 
+     uint32_t pos = 0;
+ 
++    // Sends DIRECT/DIRECTHL data to the GIF. Data first completes a GIF IMAGE left open by an
++    // earlier DIRECT (its tag asked for more qwords than that DIRECT carried); the rest is
++    // ordinary GIF packet data. VIFcodes between the two DIRECTs are still decoded: on hardware
++    // the GIF waits for more data, it doesn't take the VIF's input stream raw. (A REF DMA tag
++    // with TTE often carries "NOP; DIRECTHL n" in its upper half just before the image data.)
++    auto feedPath2 = [&](const uint8_t *ptr, uint32_t qw, bool directHl)
++    {
++        while (qw != 0u)
++        {
++            if (m_vif1PendingPath2ImageQwc != 0u)
++            {
++                const uint32_t chunkQw = std::min<uint32_t>(m_vif1PendingPath2ImageQwc, qw);
++                std::vector<uint8_t> imagePacket(16u + static_cast<size_t>(chunkQw) * 16u, 0u);
++                const uint64_t imageTag =
++                    static_cast<uint64_t>(chunkQw & 0x7FFFu) |
++                    ((m_vif1PendingPath2ImageQwc == chunkQw) ? (1ull << 15) : 0ull) |
++                    (static_cast<uint64_t>(kGifFmtImage) << 58);
++                std::memcpy(imagePacket.data(), &imageTag, sizeof(imageTag));
++                std::memcpy(imagePacket.data() + 16u, ptr, static_cast<size_t>(chunkQw) * 16u);
++                submitGifPacket(GifPathId::Path2, imagePacket.data(), static_cast<uint32_t>(imagePacket.size()), true, directHl);
++                ptr += static_cast<size_t>(chunkQw) * 16u;
++                qw -= chunkQw;
++                m_vif1PendingPath2ImageQwc -= chunkQw;
++                if (m_vif1PendingPath2ImageQwc == 0u)
++                {
++                    m_vif1PendingPath2DirectHl = false;
++                }
++                continue;
++            }
++
++            submitGifPacket(GifPathId::Path2, ptr, qw * 16u, true, directHl);
++            const uint32_t pendingImageQw = pendingGifImageQwc(ptr, qw * 16u);
++            if (pendingImageQw != 0u)
++            {
++                m_vif1PendingPath2ImageQwc = pendingImageQw;
++                m_vif1PendingPath2DirectHl = directHl;
++            }
++            break;
++        }
++    };
++
+     while (pos + 4 <= sizeBytes)
+     {
+-        if (m_vif1PendingPath2ImageQwc != 0u)
++        // The rest of a DIRECT/DIRECTHL whose data didn't fit in the previous buffer.
++        if (m_vif1PendingDirectQw != 0u)
+         {
+             const uint32_t availableQw = (sizeBytes - pos) / 16u;
+             if (availableQw == 0u)
+@@ -312,22 +376,28 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
+                 break;
+             }
+ 
+-            const uint32_t chunkQw = std::min<uint32_t>(m_vif1PendingPath2ImageQwc, availableQw);
+-            std::vector<uint8_t> imagePacket(16u + static_cast<size_t>(chunkQw) * 16u, 0u);
+-            const uint64_t imageTag =
+-                static_cast<uint64_t>(chunkQw & 0x7FFFu) |
+-                ((m_vif1PendingPath2ImageQwc == chunkQw) ? (1ull << 15) : 0ull) |
+-                (static_cast<uint64_t>(kGifFmtImage) << 58);
+-            std::memcpy(imagePacket.data(), &imageTag, sizeof(imageTag));
+-            std::memcpy(imagePacket.data() + 16u, data + pos, static_cast<size_t>(chunkQw) * 16u);
+-            submitGifPacket(GifPathId::Path2, imagePacket.data(), static_cast<uint32_t>(imagePacket.size()), true, m_vif1PendingPath2DirectHl);
+-
++            const uint32_t chunkQw = std::min<uint32_t>(m_vif1PendingDirectQw, availableQw);
++            feedPath2(data + pos, chunkQw, m_vif1PendingDirectIsHl);
+             pos += chunkQw * 16u;
+-            m_vif1PendingPath2ImageQwc -= chunkQw;
+-            if (m_vif1PendingPath2ImageQwc == 0u)
++            m_vif1PendingDirectQw -= chunkQw;
++            continue;
++        }
++
++        // A GIF IMAGE is still open. If the next VIFcodes are a DIRECT/DIRECTHL that continues it
++        // (optionally after NOP/FLUSH/MSKPATH3), decode them normally so feedPath2 picks up the
++        // image data. Otherwise keep the lenient legacy behaviour and take the following qwords
++        // as raw image data.
++        if (m_vif1PendingPath2ImageQwc != 0u && !directContinuesImageAt(data, sizeBytes, pos))
++        {
++            const uint32_t availableQw = (sizeBytes - pos) / 16u;
++            if (availableQw == 0u)
+             {
+-                m_vif1PendingPath2DirectHl = false;
++                break;
+             }
++
++            const uint32_t chunkQw = std::min<uint32_t>(m_vif1PendingPath2ImageQwc, availableQw);
++            feedPath2(data + pos, chunkQw, m_vif1PendingPath2DirectHl);
++            pos += chunkQw * 16u;
+             continue;
+         }
+ 
+@@ -495,22 +565,18 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
+             if (qwCount > availableQw)
+                 qwCount = availableQw;
+ 
++            const bool directHl = (opcode == VIF_DIRECTHL);
+             if (qwCount > 0)
+             {
+-                const bool directHl = (opcode == VIF_DIRECTHL);
+-                submitGifPacket(GifPathId::Path2, data + pos, qwCount * 16, true, directHl);
+-
+-                const uint32_t pendingImageQw = pendingGifImageQwc(data + pos, qwCount * 16u);
+-                if (pendingImageQw != 0u)
+-                {
+-                    m_vif1PendingPath2ImageQwc = pendingImageQw;
+-                    m_vif1PendingPath2DirectHl = directHl;
+-                }
++                feedPath2(data + pos, qwCount, directHl);
+             }
+ 
+             pos += qwCount * 16;
+             if (truncated)
+             {
++                // The rest of this DIRECT arrives at the start of the next buffer.
++                m_vif1PendingDirectQw = ((imm == 0u) ? 65536u : static_cast<uint32_t>(imm)) - qwCount;
++                m_vif1PendingDirectIsHl = directHl;
+                 pos = sizeBytes;
+                 break;
+             }
+diff --git a/ps2xTest/src/ps2_memory_tests.cpp b/ps2xTest/src/ps2_memory_tests.cpp
+index 0b22fe0..62be5d4 100644
+--- a/ps2xTest/src/ps2_memory_tests.cpp
++++ b/ps2xTest/src/ps2_memory_tests.cpp
+@@ -2165,6 +2165,59 @@ void register_ps2_memory_tests()
+             t.IsTrue(imageOk, "raw qwords after a DIRECT image tag should continue the PATH2 image upload");
+         });
+ 
++        tc.Run("VIF1 image split across two DIRECTHL keeps the VIFcodes between them out of the image", [](TestCase &t)
++        {
++            PS2Memory mem;
++            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
++
++            GS gs;
++            gs.init(mem.getGSVRAM(), static_cast<uint32_t>(PS2_GS_VRAM_SIZE), &mem.gs());
++            GifArbiter arbiter([&](const uint8_t *data, uint32_t sizeBytes)
++            {
++                gs.processGIFPacket(data, sizeBytes);
++            });
++            mem.setGifArbiter(&arbiter);
++
++            const uint64_t bitblt =
++                (static_cast<uint64_t>(1u) << 16) |
++                (static_cast<uint64_t>(1u) << 48);
++            gs.writeRegister(GS_REG_BITBLTBUF, bitblt);
++            gs.writeRegister(GS_REG_TRXPOS, 0ull);
++            gs.writeRegister(GS_REG_TRXREG, (8ull << 0) | (1ull << 32));
++            gs.writeRegister(GS_REG_TRXDIR, 0ull);
++
++            // Like a DMA chain with TTE: the second REF tag's upper half carries "NOP; DIRECTHL 1"
++            // in front of the second image qword, so those 8 bytes must not shift the image.
++            std::vector<uint8_t> packet;
++            appendU32(packet, makeVifCmd(0x51u, 0u, 2u)); // DIRECTHL 2: IMAGE tag (NLOOP 2) + first QW.
++            appendU64(packet, makeGifTag(2u, GIF_FMT_IMAGE, 0u, true));
++            appendU64(packet, 0ull);
++            for (uint32_t i = 0; i < 16u; ++i)
++                packet.push_back(static_cast<uint8_t>(0x10u + i));
++            appendU32(packet, makeVifCmd(0x00u, 0u, 0u)); // NOP
++            appendU32(packet, makeVifCmd(0x51u, 0u, 1u)); // DIRECTHL 1: second QW, no GIF tag.
++            for (uint32_t i = 0; i < 16u; ++i)
++                packet.push_back(static_cast<uint8_t>(0x20u + i));
++
++            mem.processVIF1Data(packet.data(), static_cast<uint32_t>(packet.size()));
++
++            const uint8_t *vramOut = mem.getGSVRAM();
++            bool imageOk = true;
++            for (uint32_t x = 0; x < 8u && imageOk; ++x)
++            {
++                const uint32_t off = GSPSMCT32::addrPSMCT32(0u, 1u, x, 0u);
++                for (uint32_t c = 0; c < 4u; ++c)
++                {
++                    if (vramOut[off + c] != static_cast<uint8_t>(0x10u + x * 4u + c))
++                    {
++                        imageOk = false;
++                        break;
++                    }
++                }
++            }
++            t.IsTrue(imageOk, "VIFcodes between two DIRECTHL halves of one IMAGE should not be uploaded as pixels");
++        });
++
+         tc.Run("VIF1 DIRECT finds an image continuation after packed setup", [](TestCase &t)
+         {
+             PS2Memory mem;
 diff --git a/ps2xTest/src/ps2_runtime_interrupt_tests.cpp b/ps2xTest/src/ps2_runtime_interrupt_tests.cpp
 index 4261bfa..f9546e1 100644
 --- a/ps2xTest/src/ps2_runtime_interrupt_tests.cpp

@@ -10,17 +10,21 @@ the game's executable) are gitignored and recreated from your own disc.
 ## Status
 
 The recompiled game boots, loads its nine IOP modules, runs its start-up, enters its main loop
-(object update, VIF1 packet build, DMA, vblank-paced flips) and draws its first screen: the
-memory-card warning. The text on that screen is garbled. Nothing past it has been reached.
+(object update, VIF1 packet build, DMA, vblank-paced flips) and draws its first screen, the
+memory-card prompt, with correct text: "There is no data for this title on the memory card (8MB)
+(for PlayStation®2) in MEMORY CARD slot 1. Start the game without loading data?". Pressing ✕
+answers it, and the game moves on to the Irem logo movie, which stays black: the PS2's MPEG
+decoder (IPU) isn't emulated. That is the current blocker.
 
 | Stage | State |
 |---|---|
 | Recompile (4,408 functions) | Done. 0 unhandled instructions, 0 decode failures, 54 indirect jumps on fallback lookup |
 | Boot, IOP modules, threads, vblank | Working, after fixes 1–3 below |
 | Main loop, DMA, GS drawing, presentation | Working, after fix 4 |
-| Memory card | Game says the card is full (see Next) |
-| Font/text | Garbled glyphs |
-| Movies (`0\*.DSI`) | Not reached. Needs IPU emulation; PS2Recomp has none |
+| Memory card | Working: an empty card gives the normal "no data" prompt |
+| Font/text | Working, after fix 5 |
+| Pad input | Working (keyboard through raylib; see `tools/run_headless.sh` for the keys) |
+| Movies (`0\*.DSI`) | **Blocker.** Logo movie starts, screen stays black. Needs IPU emulation; PS2Recomp has none |
 | Sound (`MUS.IRX`, `XA\*.VSD`) | Not reached. SPU2 isn't emulated (register stubs only) |
 | 3D (VU1 microcode) | Not reached |
 
@@ -54,14 +58,29 @@ Applies to PS2Recomp commit `e563698`. Each fix was needed to get further:
 4. **`sceGsSetDefDispEnv` stand-in left `PMODE`/`SMODE2`/`BGCOLOR` zero** (`writeGsDispEnv` in
    `Stubs/Helpers/Support.h`). The game's own `sceGsPutDispEnv` then wrote `PMODE=0`, both display
    circuits stayed off, and no frame was ever presented.
+5. **VIF1 swallowed VIFcodes in the middle of an image upload** (`ps2_vif1_interpreter.cpp`). The
+   game uploads its 4-bit font through a DMA chain with TTE on: each REF tag's upper half carries
+   `NOP; DIRECTHL 16384` in front of the next piece of the same GIF IMAGE. The runtime treated
+   everything after the first DIRECT as raw pixels while the image was still open, so those 8
+   bytes went into the texture and shifted the rest of it by 8 bytes (garbled text). Now VIFcodes
+   are decoded as on hardware and the next DIRECT's data continues the open image; a DIRECT cut
+   off at the end of a DMA buffer carries over to the next one. The old lenient behaviour (raw
+   qwords continue an open image) is kept when no DIRECT follows, so two existing upstream tests
+   still pass. New test: `VIF1 image split across two DIRECTHL keeps the VIFcodes between them
+   out of the image`.
 
-Also in the patch, off unless set: `PS2X_IDLE_DUMP=1` (guest thread wait states when the
-scheduler idles, and vblank handler dispatch), `PS2X_FRAME_DUMP=<dir>` (raw frame dumps plus
-display-register probes).
+Also in the patch, off unless set (the lookups are cached, so they cost nothing when unset):
+- `PS2X_FRAME_DUMP=<dir>`: every 30th presented frame as raw RGBA, display-register probes, and
+  at present 150 a dump of GS memory (`vram.bin`) and EE RAM (`eeram.bin`).
+- `PS2X_IDLE_DUMP=1`: guest thread wait states when the scheduler idles, and vblank dispatch.
+- `PS2X_SPRITE_LOG=1`: one line per distinct textured sprite setup and per distinct GS transfer.
+- `PS2X_SEQ_LOG=1`: GIF submissions (path, size, tag, payload hash) and GS draws/transfers in a
+  fixed window, plus the first sizeable IMAGE payload to `image_payload.bin`.
 
 PS2Recomp's test suite (built with `-DNDEBUG`, since an existing thread-affinity assert aborts
-it otherwise): 446 passed, 1 failure (`VU0 macro mappings cover all S1/S2 enums`), identical
-before and after the patch.
+it otherwise): 446 passed, 1 failure (`VU0 macro mappings cover all S1/S2 enums`, which can't
+find `instructions.h` from the test's working directory). That failure is there without the
+patch too.
 
 ## Rebuild
 
@@ -69,7 +88,7 @@ Linux (what was used, Ubuntu 24.04 cloud container):
 
 ```
 tools/setup_linux.sh "/path/to/Sub Rebellion (USA).bin"
-tools/run_headless.sh 60 run
+KEYS="20:x" tools/run_headless.sh 60 run     # ✕ at 20 s answers the memory-card prompt
 python3 tools/frames_to_png.py run/frames
 ```
 
@@ -82,15 +101,18 @@ Visual Studio 2022 but haven't been tried for this game.
 
 ## Next
 
-1. **Memory card full.** The stand-in answers `GetInfo` with `type=2 free=8192 format=1` and
-   `GetDir '/BASLUS-20548/BASLUS-20548'` with -4; the game then shows "not enough free space".
-   Find the check in the game's `Mc_*`/card code (symbols are available) and what it expects.
-2. **Garbled text.** Likely 4-bit/8-bit CLUT texture sampling or texture upload layout in
-   `GSCpuBackend` (`SampleTexture`, `LookupCLUT`, transfers). Compare the font texture in GS memory.
-3. **Input** to get past the screen (PS2Recomp reads pads via raylib).
-4. **Movies**: IPU emulation for the `.DSI` streams (or decode them on the host).
-5. **Sound**: SPU2 voices/ADPCM so `MUS.IRX`, `MODHSYN` and the `XA\*.VSD` streams play.
-6. **3D**: run the VU1 microcode through the runtime's VU1 interpreter once a mission loads.
+1. **Movies (current blocker).** After ✕ the game runs `game_logo_movie` → `racMovieStart` →
+   `racMovieStartCdvd`, whose `MovieProc` thread streams the `.DSI` file and feeds the IPU
+   (`setDMAtoIPU` is called once; `IpuHandler` never runs). `playMovie`/`onDrawMovie` are called
+   every frame and draw nothing. Two ways forward:
+   - Quick: make the game treat each movie as finished, to see the title screen and menus. The
+     candidates are `racMovieCheckDEndCdvd` (reads byte 5 of the movie state at `*0x274E34`),
+     `getMovieDoneFlag` (`-0x571C($gp)`) and the movie object's state bytes `0xB4`–`0xB7` that
+     `playMovie` updates. Best done as a runtime game override so it doesn't force a full rebuild.
+   - Proper: IPU emulation (MPEG-2 I/P/B decode plus colour conversion through IPU DMA), or
+     decoding the `.DSI` streams on the host.
+2. **Sound**: SPU2 voices/ADPCM so `MUS.IRX`, `MODHSYN` and the `XA\*.VSD` streams play.
+3. **3D**: run the VU1 microcode through the runtime's VU1 interpreter once a mission loads.
 
 ## Debugging notes
 
@@ -100,3 +122,7 @@ Visual Studio 2022 but haven't been tried for this game.
   e.g. `break readInit_0x10ad18`. Guest registers are 16 bytes apart in `R5900Context`
   (`*(int*)((char*)$rsi + 16*N)` is `$N` inside a recompiled function).
 - `tools/run_headless.sh` uses llvmpipe; Xvfb screenshots stay black, frame dumps don't.
+- The memory-card "no data" screen is normal for an empty card; no card fix was needed.
+- Text problems on the GS side: dump GS memory (`PS2X_FRAME_DUMP`, `vram.bin`) and decode the
+  font page with PS2Recomp's own `GSMem` swizzle helpers (call `GSMem::InitLookupTables()`
+  first). The swizzle matched hardware; the bug was upstream of the GS, in VIF1 (fix 5).

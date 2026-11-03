@@ -154,6 +154,14 @@ Applies to PS2Recomp commit `e563698`. Each fix was needed to get further:
     vblank-timed intro gets further in the same wall time. On a desktop CPU the GS thread has a
     core to itself; `Play Sub Rebellion (no GS thread).cmd` (`PS2X_GS_ASYNC=0`) is there to
     compare.
+17. **IOP run in batches** (`ps2xIOP/src/emulator/iop_emulator.cpp`). The EE scheduler reports
+    time every 8 EE cycles, and each report ran the IOP for one cycle: a full pass over the IOP
+    thread table (a `std::map`, twice, plus dead-thread cleanup) and its timers per cycle. In the
+    base menu that bookkeeping was ~20% of the game thread. Owed cycles now accumulate and run
+    once there are 256 (~7 us of IOP time); `cycles()` counts the owed ones too (an upstream
+    SIF test reads it after 10 cycles). With it, emulated time in the menus keeps up with real
+    time (60 vblanks/s instead of 20-30), so vblank-paced things, the CD loader included, run at
+    PS2 speed there. All `ps2xIOP` tests pass.
 
 Also in the patch, off unless set (the lookups are cached, so they cost nothing when unset):
 - `PS2X_FRAME_DUMP=<dir>`: every 30th presented frame as raw RGBA, display-register probes, and
@@ -203,6 +211,17 @@ sets `PS2X_DEINTERLACE=weave` and `PS2X_ASPECT=4:3`, makes stdout unbuffered (so
   two functions rewritten without their side effects. Whether real hardware loads faster per
   frame or the briefing normally leaves the files resident wasn't settled; either way the stage
   now waits for its data.
+- **limits files per frame.** The read queue hands each file to the CD thread, which on a PS2
+  finishes about one per vblank, two per 30 fps frame. Here a drawn frame spans many vblanks,
+  and once files completing per frame got far above what hardware ever produced (with the IOP
+  batching above, or when the CD thread's wait was skipped to load faster), VU1 started kicking
+  garbage GIF packets (`[VU1 reserved lower] ... instruction=0xfffffffb`, the XGKICK overflow
+  code) in the intro, and in another try the base menu background and the mission seabed went
+  missing: 3D data replaced while still in use. `racCdvdRequestSec` calls from `readPolling`
+  are refused, as if the CD queue were full, after 4 per displayed frame
+  (`PS2X_CD_FILES_PER_FRAME`, 0 = no limit). With that, 3 of 3 intro runs with IOP batching
+  were clean (3 of 4 had the errors without it), and Mission 01's data loads in ~13 s in the
+  2-core container, where it took minutes before.
 - `PS2X_CD_TRACE=1` logs the read module and CD calls (`readOpen`, `readGetAdr` with where the
   file sits: loaded, queued or absent; `racCdvdRequest*`, `racCdvdSync`, `sceCdRead`,
   `readDoneCheckAll`, `MissionLoad`, `mission_wait`, `CSTG_Create` with the mission flags).

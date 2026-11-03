@@ -31,8 +31,8 @@ WHAT TO EXPECT
     starts it the old way (drawing on the game thread), for comparing the two.
   - Last tested: through the intro, base menu and world map into Mission 01 (the cockpit
     and the in-mission tutorial run). Play beyond that is untested.
-  - "MISSION 01 / NOW LOADING" takes a while at this speed; the game now waits there until
-    the mission's files are loaded instead of crashing.
+  - Loading screens: the game waits there until the mission's files are loaded. They are
+    faster than in earlier builds but still take a while.
   - The window opens at 1280x960 and can be resized or maximized; the picture is shown at
     the PS2's 4:3. Other window size: set PS2X_WINDOW_SIZE=WIDTHxHEIGHT in
     "Play Sub Rebellion.cmd". PS2X_ASPECT=16:9 stretches to widescreen, PS2X_ASPECT=stretch

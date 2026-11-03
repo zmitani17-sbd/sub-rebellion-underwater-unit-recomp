@@ -88,7 +88,7 @@ index a932a5d..79f494c 100644
      {
      public:
 diff --git a/ps2xIOP/src/emulator/iop_emulator.cpp b/ps2xIOP/src/emulator/iop_emulator.cpp
-index e5f63a9..54f8b76 100644
+index e5f63a9..623bad5 100644
 --- a/ps2xIOP/src/emulator/iop_emulator.cpp
 +++ b/ps2xIOP/src/emulator/iop_emulator.cpp
 @@ -1,3 +1,8 @@
@@ -131,7 +131,15 @@ index e5f63a9..54f8b76 100644
  namespace ps2x::iop::detail
  {
      namespace
-@@ -378,7 +407,9 @@ namespace ps2x::iop::detail
+@@ -131,6 +160,7 @@ namespace ps2x::iop::detail
+             totalCycles = 0;
+             totalInstructions = 0;
+             eeCycleCarry = 0;
++            pendingIopCycles = 0;
+             activeCpu = nullptr;
+             lastError.clear();
+             servicingDmaInterrupts = false;
+@@ -378,7 +408,9 @@ namespace ps2x::iop::detail
              if (checkInterrupt(cpu))
                  return true;
  
@@ -142,7 +150,7 @@ index e5f63a9..54f8b76 100644
              {
                  const ImportDisposition disposition = dispatchImport(*import, cpu);
                  ++totalInstructions;
-@@ -577,6 +608,9 @@ namespace ps2x::iop::detail
+@@ -577,6 +609,9 @@ namespace ps2x::iop::detail
                      }
                      const uint64_t before = totalCycles;
                      runCpu(next->cpu, static_cast<uint32_t>(std::min<uint64_t>(kDefaultSlice, target - totalCycles)));
@@ -152,6 +160,48 @@ index e5f63a9..54f8b76 100644
                      kernel.endTimeslice(*next, kThreadReturnSentinel);
                      if (totalCycles == before)
                          ++totalCycles;
+@@ -702,6 +737,10 @@ namespace ps2x::iop::detail
+         uint64_t totalCycles = 0;
+         uint64_t totalInstructions = 0;
+         uint64_t eeCycleCarry = 0;
++        // IOP cycles owed but not run yet. The EE scheduler reports time every few EE cycles
++        // (8 per dispatch), and every runCycles() call walks the thread table and timers, so
++        // running the IOP one cycle at a time cost more than the IOP code itself.
++        uint64_t pendingIopCycles = 0;
+         CpuState *activeCpu = nullptr;
+         std::string lastError;
+         bool servicingDmaInterrupts = false;
+@@ -741,11 +780,18 @@ namespace ps2x::iop::detail
+ 
+     void IopEmulator::runEeCycles(uint64_t eeCycles) noexcept
+     {
++        // Run the IOP in batches of at least this many cycles (~7 us of IOP time), which is far
++        // below anything an EE/IOP handshake can observe.
++        constexpr uint64_t kMinIopBatchCycles = 256u;
+         const uint64_t total = m_impl->eeCycleCarry + eeCycles;
+-        const uint64_t iopCycles = total / 8u;
+         m_impl->eeCycleCarry = total % 8u;
+-        if (iopCycles)
++        m_impl->pendingIopCycles += total / 8u;
++        if (m_impl->pendingIopCycles >= kMinIopBatchCycles)
++        {
++            const uint64_t iopCycles = m_impl->pendingIopCycles;
++            m_impl->pendingIopCycles = 0;
+             m_impl->runCycles(iopCycles);
++        }
+     }
+ 
+     RpcResult IopEmulator::handleRpc(const RpcRequest &request)
+@@ -804,7 +850,8 @@ namespace ps2x::iop::detail
+ 
+     uint64_t IopEmulator::cycles() const noexcept
+     {
+-        return m_impl->totalCycles;
++        // Includes the cycles owed to the next batch (see runEeCycles).
++        return m_impl->totalCycles + m_impl->pendingIopCycles;
+     }
+ 
+     uint64_t IopEmulator::instructions() const noexcept
 diff --git a/ps2xIOP/src/emulator/services/iop_rpc.cpp b/ps2xIOP/src/emulator/services/iop_rpc.cpp
 index cf4fdc6..d7ea762 100644
 --- a/ps2xIOP/src/emulator/services/iop_rpc.cpp

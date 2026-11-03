@@ -6,12 +6,15 @@
 #include "ps2_runtime.h"
 #include "ps2_runtime_macros.h"
 
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include <map>
 #include <string>
+
+uint64_t gsDisplayFlipCount(); // PS2Recomp patch, ps2_memory.cpp: the game's display flips
 
 namespace
 {
@@ -153,20 +156,63 @@ namespace
 
     void missionWaitForData(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        static bool s_waiting = false;
+        static std::chrono::steady_clock::time_point s_waitStart;
         const uint32_t gp = GPR_U32(ctx, 28);
         const bool returnFlag = rdram[(gp - 0x56C4u) & PS2_RAM_MASK] != 0u; // MissionReturnFlag
         if (returnFlag && !(allReadsDone(rdram, gp) && allTexturesReady(rdram, gp)))
         {
-            static bool s_logged = false;
-            if (!s_logged)
+            if (!s_waiting)
             {
-                s_logged = true;
+                s_waiting = true;
+                s_waitStart = std::chrono::steady_clock::now();
                 std::cerr << "[sub-rebellion] mission start: waiting for the stage data to load" << std::endl;
             }
             ctx->pc = GPR_U32(ctx, 31); // what mission_wait does while it waits: return
             return;
         }
+        if (s_waiting)
+        {
+            s_waiting = false;
+            const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - s_waitStart).count();
+            std::fprintf(stderr, "[sub-rebellion] mission data loaded after %.1f s\n", seconds);
+        }
         g_missionWaitOriginal(rdram, ctx, runtime);
+    }
+
+    // Files per frame. The game's read queue (readPolling, 0x10AE38) hands one request per file
+    // to the CD thread, which on a PS2 finishes about one per vblank, two per 30 fps frame. Here
+    // frames take many vblanks, so many more files finish per drawn frame than the game ever saw
+    // on hardware, and when that ratio gets high (faster IOP stepping, or a hurried CD thread)
+    // some 3D data is replaced while still in use: VU1 then kicks garbage GIF packets. Refuse
+    // readPolling's request (as if the CD queue were full; it retries next call) once this frame
+    // has had kFilesPerFrame. PS2X_CD_FILES_PER_FRAME overrides, 0 = no limit.
+    constexpr uint32_t kRacCdvdRequestSec = 0x1eda58u;
+    constexpr uint32_t kReadPollingRequestReturn = 0x10af40u;
+    PS2Runtime::RecompiledFunction g_requestSecOriginal = nullptr;
+    uint32_t g_filesPerFrame = 4u;
+
+    void requestSecPerFrame(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        if (g_filesPerFrame != 0u && GPR_U32(ctx, 31) == kReadPollingRequestReturn)
+        {
+            static uint64_t s_frame = ~0ull;
+            static uint32_t s_issued = 0u;
+            const uint64_t frame = gsDisplayFlipCount();
+            if (frame != s_frame)
+            {
+                s_frame = frame;
+                s_issued = 0u;
+            }
+            if (s_issued >= g_filesPerFrame)
+            {
+                SET_GPR_U32(ctx, 2, 0u); // "queue full": readPolling stops and tries again later
+                ctx->pc = GPR_U32(ctx, 31);
+                return;
+            }
+            ++s_issued;
+        }
+        g_requestSecOriginal(rdram, ctx, runtime);
     }
 
     template <uint32_t Address>
@@ -264,6 +310,14 @@ namespace
         if (!g_missionWaitOriginal || !runtime.replaceFunction(kMissionWait, &missionWaitForData))
         {
             std::cerr << "[sub-rebellion] could not replace mission_wait" << std::endl;
+        }
+
+        if (const char *limit = std::getenv("PS2X_CD_FILES_PER_FRAME"))
+            g_filesPerFrame = static_cast<uint32_t>(std::strtoul(limit, nullptr, 10));
+        g_requestSecOriginal = runtime.lookupFunction(kRacCdvdRequestSec);
+        if (!g_requestSecOriginal || !runtime.replaceFunction(kRacCdvdRequestSec, &requestSecPerFrame))
+        {
+            std::cerr << "[sub-rebellion] could not replace racCdvdRequestSec" << std::endl;
         }
 
         if (std::getenv("PS2X_CD_TRACE"))

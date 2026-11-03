@@ -88,7 +88,7 @@ index a932a5d..79f494c 100644
      {
      public:
 diff --git a/ps2xIOP/src/emulator/iop_emulator.cpp b/ps2xIOP/src/emulator/iop_emulator.cpp
-index e5f63a9..021ed6b 100644
+index e5f63a9..54f8b76 100644
 --- a/ps2xIOP/src/emulator/iop_emulator.cpp
 +++ b/ps2xIOP/src/emulator/iop_emulator.cpp
 @@ -1,3 +1,8 @@
@@ -131,7 +131,18 @@ index e5f63a9..021ed6b 100644
  namespace ps2x::iop::detail
  {
      namespace
-@@ -577,6 +606,9 @@ namespace ps2x::iop::detail
+@@ -378,7 +407,9 @@ namespace ps2x::iop::detail
+             if (checkInterrupt(cpu))
+                 return true;
+ 
+-            if (const auto import = imports.decode(cpu.pc))
++            // Only "jr $ra" can start an import stub ("jr $ra; addiu $zero, $zero, ordinal"), so
++            // skip the stub lookup for every other instruction.
++            if (const auto import = memory.read32(cpu.pc) == 0x03E00008u ? imports.decode(cpu.pc) : std::nullopt)
+             {
+                 const ImportDisposition disposition = dispatchImport(*import, cpu);
+                 ++totalInstructions;
+@@ -577,6 +608,9 @@ namespace ps2x::iop::detail
                      }
                      const uint64_t before = totalCycles;
                      runCpu(next->cpu, static_cast<uint32_t>(std::min<uint64_t>(kDefaultSlice, target - totalCycles)));
@@ -266,20 +277,25 @@ index 420f053..a2759c3 100644
      }
  
 diff --git a/ps2xRuntime/CMakeLists.txt b/ps2xRuntime/CMakeLists.txt
-index 589d768..2e98d83 100644
+index 589d768..d79d034 100644
 --- a/ps2xRuntime/CMakeLists.txt
 +++ b/ps2xRuntime/CMakeLists.txt
-@@ -396,6 +396,15 @@ add_library(ps2_runtime STATIC
+@@ -396,6 +396,20 @@ add_library(ps2_runtime STATIC
      src/lib/games_database.cpp
  )
  
-+# Extra compile options for the runtime library only, not the generated game code (e.g. "-O2"
++# Extra compile options for the runtime and IOP libraries only, not the generated game code (e.g. "-O2"
 +# while the generated code stays at -O1 to keep its compile time down). The software GS
 +# renderer lives here and is the main per-frame cost.
 +set(PS2X_RUNTIME_LIB_COMPILE_OPTIONS "" CACHE STRING "Extra compile options for ps2_runtime only")
 +if(PS2X_RUNTIME_LIB_COMPILE_OPTIONS)
 +    separate_arguments(PS2X_RUNTIME_LIB_COMPILE_OPTIONS_LIST NATIVE_COMMAND "${PS2X_RUNTIME_LIB_COMPILE_OPTIONS}")
 +    target_compile_options(ps2_runtime PRIVATE ${PS2X_RUNTIME_LIB_COMPILE_OPTIONS_LIST})
++    # The IOP interpreter runs on the game thread too (at the IOP's real clock rate), so it
++    # gets the same options.
++    if(TARGET ps2_iop)
++        target_compile_options(ps2_iop PRIVATE ${PS2X_RUNTIME_LIB_COMPILE_OPTIONS_LIST})
++    endif()
 +endif()
 +
  if(PS2X_ENABLE_RUNTIME_LOGS)
@@ -299,19 +315,21 @@ index ea86a9c..ef26cdd 100644
  
      struct PendingTransfer
 diff --git a/ps2xRuntime/include/runtime/ps2_vu1.h b/ps2xRuntime/include/runtime/ps2_vu1.h
-index 67c8184..9006a26 100644
+index 67c8184..20e399d 100644
 --- a/ps2xRuntime/include/runtime/ps2_vu1.h
 +++ b/ps2xRuntime/include/runtime/ps2_vu1.h
-@@ -217,6 +217,7 @@ private:
+@@ -216,7 +216,9 @@ private:
+     std::array<PendingVfWrite, kMaxPendingVfWrites> m_vfWritePipeline{};
      std::array<PendingViWrite, kMaxPendingViWrites> m_viWritePipeline{};
      std::array<PendingAccWrite, kMaxPendingAccWrites> m_accWritePipeline{};
++    uint64_t m_nextCommitCycle = UINT64_MAX; // earliest readyCycle among pending entries
      XgkickPipeline m_xgkick{};
 +    uint32_t m_lastStartPc = 0u; // diagnostics (PS2X_VU_LOG)
      std::array<std::array<uint64_t, 4>, 32> m_vfReady{};
      std::array<uint64_t, 16> m_viReady{};
      std::array<uint64_t, 4> m_accReady{};
 diff --git a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
-index c5e31c4..76aae8f 100644
+index c5e31c4..ca779f5 100644
 --- a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
 +++ b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
 @@ -1,3 +1,5 @@
@@ -353,7 +371,26 @@ index c5e31c4..76aae8f 100644
                  waitForEvent();
                  continue;
              }
-@@ -1237,25 +1265,47 @@ int EeScheduler::setIrqHandlerEnabled(bool dmac, int id, bool enabled)
+@@ -376,8 +404,17 @@ bool EeScheduler::checkpointDue(uint32_t cycles) noexcept
+         return false;
+     }
+ 
++    // The PS2 kernel never time-slices: a thread keeps the CPU until it waits, yields or a
++    // higher-priority thread becomes ready. PS2X_EE_TIMESLICE=off follows that for games whose
++    // threads share data without locks; by default equal-priority threads take turns.
++    static const bool s_sameRoundRobin = []
++    {
++        const char *value = std::getenv("PS2X_EE_TIMESLICE");
++        return !(value && (std::strcmp(value, "off") == 0 || std::strcmp(value, "0") == 0));
++    }();
+     const GuestThread *running = currentThread();
+-    if (running != nullptr && hasReadyAtOrAbovePriority(running->currentPriority))
++    const int preemptLimit = running ? (s_sameRoundRobin ? running->currentPriority : running->currentPriority - 1) : -1;
++    if (running != nullptr && preemptLimit >= 0 && hasReadyAtOrAbovePriority(preemptLimit))
+     {
+         m_rescheduleRequested = true;
+         m_timeSliceExpired = true;
+@@ -1237,25 +1274,47 @@ int EeScheduler::setIrqHandlerEnabled(bool dmac, int id, bool enabled)
  int EeScheduler::setIrqCauseEnabled(bool dmac, uint32_t cause, bool enabled)
  {
      assertExecutor();
@@ -1304,7 +1341,7 @@ index 37b6a4d..496d8ec 100644
      {
          if (m_path3Masked)
 diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
-index 45cb9d2..a4ade45 100644
+index 45cb9d2..a38c0a7 100644
 --- a/ps2xRuntime/src/lib/ps2_runtime.cpp
 +++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
 @@ -1,3 +1,6 @@
@@ -1400,6 +1437,66 @@ index 45cb9d2..a4ade45 100644
      m_memory.setVu1MscalCallback([this](uint32_t startPC, uint32_t top, uint32_t itop)
                                   {
                                       R5900Context *cpuContext = m_eeScheduler ? m_eeScheduler->currentContext() : nullptr;
+@@ -732,7 +785,19 @@ bool PS2Runtime::initialize(const char *title)
+         InitWindow(HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT, title); // raylib vita does not support audio
+ #else
+         SetConfigFlags(FLAG_WINDOW_RESIZABLE);
+-        InitWindow(HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT, title);
++        // PS2X_WINDOW_SIZE=<width>x<height> sets the starting window size (it stays resizable).
++        int windowWidth = HOST_WINDOW_WIDTH;
++        int windowHeight = HOST_WINDOW_HEIGHT;
++        if (const char *size = std::getenv("PS2X_WINDOW_SIZE"))
++        {
++            int w = 0, h = 0;
++            if (std::sscanf(size, "%dx%d", &w, &h) == 2 && w >= 160 && h >= 120 && w <= 16384 && h <= 16384)
++            {
++                windowWidth = w;
++                windowHeight = h;
++            }
++        }
++        InitWindow(windowWidth, windowHeight, title);
+         InitAudioDevice();
+         m_audioBackend.setAudioReady(IsAudioDeviceReady());
+ #endif
+@@ -2424,15 +2489,35 @@ void PS2Runtime::run()
+         uint32_t presentHeight = DEFAULT_DISPLAY_HEIGHT;
+         UploadFrame(frameTex, this, presentWidth, presentHeight);
+ 
++        if (IsKeyPressed(KEY_F11))
++            ToggleBorderlessWindowed();
+         BeginDrawing();
+         ClearBackground(BLACK);
+         const float srcWidth = static_cast<float>(std::max<uint32_t>(1u, presentWidth));
+         const float srcHeight = static_cast<float>(std::max<uint32_t>(1u, presentHeight));
+         const float screenWidth = static_cast<float>(GetScreenWidth());
+         const float screenHeight = static_cast<float>(GetScreenHeight());
+-        const float scale = std::min(screenWidth / srcWidth, screenHeight / srcHeight);
+-        const float dstWidth = srcWidth * scale;
+-        const float dstHeight = srcHeight * scale;
++        // PS2X_ASPECT: "4:3" or "16:9" shows the frame at that display aspect, as a TV would
++        // stretch it (a 512x448 frame fills a 4:3 screen); "stretch" fills the window; anything
++        // else keeps square pixels. Read every frame so a game override can set it.
++        float displayAspect = srcWidth / srcHeight;
++        bool stretchToWindow = false;
++        if (const char *aspect = std::getenv("PS2X_ASPECT"))
++        {
++            if (std::strcmp(aspect, "4:3") == 0)
++                displayAspect = 4.0f / 3.0f;
++            else if (std::strcmp(aspect, "16:9") == 0)
++                displayAspect = 16.0f / 9.0f;
++            else if (std::strcmp(aspect, "stretch") == 0)
++                stretchToWindow = true;
++        }
++        float dstWidth = screenWidth;
++        float dstHeight = screenHeight;
++        if (!stretchToWindow)
++        {
++            dstHeight = std::min(screenHeight, screenWidth / displayAspect);
++            dstWidth = dstHeight * displayAspect;
++        }
+         const Rectangle srcRect{0.0f, 0.0f, srcWidth, srcHeight};
+         const Rectangle dstRect{
+             (screenWidth - dstWidth) * 0.5f,
 diff --git a/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp b/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp
 index f872edd..6f0820b 100644
 --- a/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp
@@ -1604,7 +1701,7 @@ index f872edd..6f0820b 100644
                  break;
              }
 diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
-index f19e281..e1bdbb8 100644
+index f19e281..22b4c08 100644
 --- a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
 +++ b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
 @@ -1,3 +1,4 @@
@@ -1612,7 +1709,183 @@ index f19e281..e1bdbb8 100644
  #include "runtime/ps2_vu1.h"
  #include "runtime/gs/ps2_gif_arbiter.h"
  #include "runtime/gs/gs_frontend.h"
-@@ -890,6 +891,37 @@ void VU1Interpreter::progressXgkick()
+@@ -73,6 +74,7 @@ void VU1Interpreter::resetScheduler()
+     m_vfWritePipeline = {};
+     m_viWritePipeline = {};
+     m_accWritePipeline = {};
++    m_nextCommitCycle = UINT64_MAX;
+     m_xgkick = {};
+     m_vfReady = {};
+     m_viReady = {};
+@@ -533,6 +535,7 @@ void VU1Interpreter::updateFmacFlags(const uint8_t laneFlags[4], uint8_t dest,
+     entry->valid = true;
+     entry->issueCycle = m_cycle;
+     entry->readyCycle = m_cycle + kFmacLatency;
++    m_nextCommitCycle = std::min(m_nextCommitCycle, entry->readyCycle);
+     entry->mac = mac;
+     entry->status = status;
+     entry->extraSticky = extraSticky;
+@@ -572,6 +575,7 @@ void VU1Interpreter::queueFsset(uint16_t immediate)
+             entry.valid = true;
+             entry.issueCycle = m_cycle;
+             entry.readyCycle = m_cycle + kFmacLatency;
++            m_nextCommitCycle = std::min(m_nextCommitCycle, entry.readyCycle);
+             entry.status = static_cast<uint32_t>(immediate) & 0xFC0u;
+             entry.writesSticky = true;
+             return;
+@@ -591,6 +595,7 @@ void VU1Interpreter::queueClip(uint32_t clip)
+             entry.valid = true;
+             entry.issueCycle = m_cycle;
+             entry.readyCycle = m_cycle + kFmacLatency;
++            m_nextCommitCycle = std::min(m_nextCommitCycle, entry.readyCycle);
+             entry.clip = m_workingClip;
+             entry.writesClip = true;
+             return;
+@@ -615,6 +620,7 @@ void VU1Interpreter::queueFcset(uint32_t clip)
+             entry.valid = true;
+             entry.issueCycle = m_cycle;
+             entry.readyCycle = m_cycle + kFmacLatency;
++            m_nextCommitCycle = std::min(m_nextCommitCycle, entry.readyCycle);
+             entry.clip = m_workingClip;
+             entry.writesClip = true;
+             return;
+@@ -629,6 +635,7 @@ void VU1Interpreter::queueQ(float value, uint32_t latency, uint32_t statusDi)
+     value = normalizeResult(value, ignoredFlags);
+     m_fdiv.valid = true;
+     m_fdiv.readyCycle = m_cycle + latency;
++    m_nextCommitCycle = std::min(m_nextCommitCycle, m_fdiv.readyCycle);
+     m_fdiv.value = value;
+     m_fdiv.statusDi = statusDi & 0x30u;
+ }
+@@ -643,6 +650,7 @@ void VU1Interpreter::queueP(float value, uint32_t latency)
+         {
+             entry.valid = true;
+             entry.readyCycle = m_cycle + latency;
++            m_nextCommitCycle = std::min(m_nextCommitCycle, entry.readyCycle);
+             entry.value = value;
+             // EFU throughput is one cycle shorter than result visibility.
+             m_efuResourceReady = m_cycle + (latency > 0u ? latency - 1u : 0u);
+@@ -660,6 +668,7 @@ void VU1Interpreter::queueStore(uint32_t address, const uint32_t words[4], uint8
+         {
+             store.valid = true;
+             store.readyCycle = m_cycle + 1u;
++            m_nextCommitCycle = std::min(m_nextCommitCycle, store.readyCycle);
+             store.address = address;
+             store.laneMask = laneMask;
+             std::copy(words, words + 4, store.words.begin());
+@@ -681,6 +690,7 @@ void VU1Interpreter::queueVfWrite(uint8_t reg, uint8_t laneMask,
+             write = {};
+             write.valid = true;
+             write.readyCycle = m_cycle + latency;
++            m_nextCommitCycle = std::min(m_nextCommitCycle, write.readyCycle);
+             write.sequence = ++m_nextWriteSequence;
+             write.reg = reg;
+             write.laneMask = laneMask;
+@@ -707,6 +717,7 @@ void VU1Interpreter::queueViWrite(uint8_t reg, int32_t value, uint32_t latency)
+             write = {};
+             write.valid = true;
+             write.readyCycle = m_cycle + latency;
++            m_nextCommitCycle = std::min(m_nextCommitCycle, write.readyCycle);
+             write.sequence = ++m_nextWriteSequence;
+             write.reg = reg;
+             write.value = value;
+@@ -728,6 +739,7 @@ void VU1Interpreter::queueAccWrite(uint8_t laneMask, const float value[4], uint3
+             write = {};
+             write.valid = true;
+             write.readyCycle = m_cycle + latency;
++            m_nextCommitCycle = std::min(m_nextCommitCycle, write.readyCycle);
+             write.sequence = ++m_nextWriteSequence;
+             write.laneMask = laneMask;
+             std::copy(value, value + 4, write.value.begin());
+@@ -744,9 +756,23 @@ void VU1Interpreter::queueAccWrite(uint8_t laneMask, const float value[4], uint3
+ 
+ void VU1Interpreter::commitReadyPipelines()
+ {
++    // Nothing queued becomes visible before m_nextCommitCycle (the earliest readyCycle of any
++    // pending entry), so skip scanning ~50 pipeline slots on every cycle until then. One pass
++    // commits what is due and finds the next due cycle.
++    if (m_cycle < m_nextCommitCycle)
++        return;
++    uint64_t next = UINT64_MAX;
++    const auto notYet = [&](uint64_t readyCycle)
++    {
++        if (readyCycle <= m_cycle)
++            return false;
++        next = std::min(next, readyCycle);
++        return true;
++    };
++
+     for (FlagPipelineEntry &entry : m_flagPipeline)
+     {
+-        if (!entry.valid || entry.readyCycle > m_cycle)
++        if (!entry.valid || notYet(entry.readyCycle))
+             continue;
+ 
+         if (entry.writesMac)
+@@ -765,7 +791,7 @@ void VU1Interpreter::commitReadyPipelines()
+         entry = {};
+     }
+ 
+-    if (m_fdiv.valid && m_fdiv.readyCycle <= m_cycle)
++    if (m_fdiv.valid && !notYet(m_fdiv.readyCycle))
+     {
+         m_state.q = m_fdiv.value;
+         const uint32_t currentDi = m_fdiv.statusDi & 0x30u;
+@@ -775,7 +801,7 @@ void VU1Interpreter::commitReadyPipelines()
+ 
+     for (ScalarPipelineEntry &entry : m_efu)
+     {
+-        if (entry.valid && entry.readyCycle <= m_cycle)
++        if (entry.valid && !notYet(entry.readyCycle))
+         {
+             m_state.p = entry.value;
+             entry = {};
+@@ -784,7 +810,7 @@ void VU1Interpreter::commitReadyPipelines()
+ 
+     for (PendingStore &store : m_storePipeline)
+     {
+-        if (!store.valid || store.readyCycle > m_cycle)
++        if (!store.valid || notYet(store.readyCycle))
+             continue;
+         if (m_activeVuData && store.address + 16u <= m_activeVuDataSize)
+         {
+@@ -802,7 +828,7 @@ void VU1Interpreter::commitReadyPipelines()
+ 
+     for (PendingVfWrite &write : m_vfWritePipeline)
+     {
+-        if (!write.valid || write.readyCycle > m_cycle)
++        if (!write.valid || notYet(write.readyCycle))
+             continue;
+         for (uint32_t component = 0; component < 4u; ++component)
+         {
+@@ -817,7 +843,7 @@ void VU1Interpreter::commitReadyPipelines()
+ 
+     for (PendingViWrite &write : m_viWritePipeline)
+     {
+-        if (!write.valid || write.readyCycle > m_cycle)
++        if (!write.valid || notYet(write.readyCycle))
+             continue;
+         if (m_viLatestWrite[write.reg] == write.sequence)
+             m_state.vi[write.reg] = static_cast<int16_t>(write.value);
+@@ -826,7 +852,7 @@ void VU1Interpreter::commitReadyPipelines()
+ 
+     for (PendingAccWrite &write : m_accWritePipeline)
+     {
+-        if (!write.valid || write.readyCycle > m_cycle)
++        if (!write.valid || notYet(write.readyCycle))
+             continue;
+         for (uint32_t component = 0; component < 4u; ++component)
+         {
+@@ -838,6 +864,8 @@ void VU1Interpreter::commitReadyPipelines()
+         }
+         write = {};
+     }
++
++    m_nextCommitCycle = next;
+ }
+ 
+ void VU1Interpreter::progressXgkick()
+@@ -890,6 +918,37 @@ void VU1Interpreter::progressXgkick()
  
              if (tagBytes > XgkickPipeline::kBufferSize - qwordOffset)
              {
@@ -1650,7 +1923,36 @@ index f19e281..e1bdbb8 100644
                  reportReservedInstruction(false, 0xFFFFFFFBu);
                  m_xgkick.active = false;
                  return;
-@@ -1591,6 +1623,7 @@ void VU1Interpreter::execute(uint8_t *vuCode, uint32_t codeSize,
+@@ -1005,11 +1064,8 @@ uint64_t VU1Interpreter::calculatePairReadyCycle(const DecodedInstructionPair &d
+                     ready = std::max(ready, m_vfReady[access.reg][component]);
+             }
+         }
+-        for (uint32_t reg = 1; reg < m_viReady.size(); ++reg)
+-        {
+-            if ((usage->viRead & (1u << reg)) != 0u)
+-                ready = std::max(ready, m_viReady[reg]);
+-        }
++        for (uint32_t bits = usage->viRead & 0xFFFEu; bits != 0u; bits &= bits - 1u)
++            ready = std::max(ready, m_viReady[static_cast<uint32_t>(__builtin_ctz(bits))]);
+         for (uint32_t component = 0; component < 4u; ++component)
+         {
+             if ((usage->accRead & laneForComponent(component)) != 0u)
+@@ -1063,11 +1119,9 @@ void VU1Interpreter::markPairWrites(const DecodedInstructionPair &decoded)
+         }
+     }
+ 
+-    for (uint32_t reg = 1; reg < m_viReady.size(); ++reg)
+-    {
+-        if ((decoded.lowerUsage.viWrite & (1u << reg)) != 0u)
+-            m_viReady[reg] = m_cycle + (decoded.lowerUsage.viLatency != 0u ? decoded.lowerUsage.viLatency : decoded.lowerUsage.latency);
+-    }
++    for (uint32_t bits = decoded.lowerUsage.viWrite & 0xFFFEu; bits != 0u; bits &= bits - 1u)
++        m_viReady[static_cast<uint32_t>(__builtin_ctz(bits))] =
++            m_cycle + (decoded.lowerUsage.viLatency != 0u ? decoded.lowerUsage.viLatency : decoded.lowerUsage.latency);
+     for (uint32_t component = 0; component < 4u; ++component)
+     {
+         if ((decoded.upperUsage.accWrite & laneForComponent(component)) != 0u)
+@@ -1591,6 +1645,7 @@ void VU1Interpreter::execute(uint8_t *vuCode, uint32_t codeSize,
                               uint32_t maxCycles)
  {
      resetScheduler();

@@ -10,12 +10,13 @@ the game's executable) are gitignored and recreated from your own disc.
 ## Status
 
 The recompiled game boots, runs its front end (memory-card prompt, title screen, NEW GAME,
-difficulty select, "NOW LOADING...") and plays the in-engine 3D intro in full detail: sunken
-skyscrapers, attack submarines, torpedoes, explosions, bubbles, fog, with its subtitles ("Fifteen
-years ago... humankind did not stop fighting amongst themselves."). It runs natively on Windows
-(MinGW cross-build, tested on a Ryzen 7 9800X3D at roughly 7-15 fps in menus and 3-5 fps in 3D)
-and Linux. The logo movies are skipped (no IPU emulation) and there is no sound yet. Next: see
-whether the intro hands over to a playable mission.
+difficulty select, "NOW LOADING..."), plays the in-engine 3D intro in full detail (sunken
+skyscrapers, attack submarines, torpedoes, explosions, bubbles, fog, with its subtitles), goes
+through the base menu and world map, and **loads Mission 01** ("The Chronos' Maiden Voyage"):
+the cockpit HUD (radar, speed, depth, shield, decoy), the seabed and the in-mission tutorial
+("& finds long-range targets.") all run. It runs natively on Windows (MinGW cross-build; on a
+Ryzen 7 9800X3D roughly 7-15 fps in menus, 3-7 fps in 3D) and Linux. The logo movies are skipped
+(no IPU emulation) and there is no sound yet.
 
 | Stage | State |
 |---|---|
@@ -30,6 +31,7 @@ whether the intro hands over to a playable mission.
 | Sound (`MUS.IRX`, `XA\*.VSD`) | Not reached. SPU2 isn't emulated (register stubs only) |
 | 3D (VU1 microcode) | Working in the intro, after fixes 6 and 11 |
 | IOP sound driver (`MUS.IRX`) talking back to the EE | Working, after fix 9 |
+| Base menu, world map, Mission 01 | Loads and runs, after the mission-data wait in `overrides/` |
 
 ## The game
 
@@ -115,6 +117,18 @@ Applies to PS2Recomp commit `e563698`. Each fix was needed to get further:
     took it for a readback point and waited forever for the FINISH at the frame's end (the hang
     at "all were forced to adopt new forms."). The guard is now 262144 tags or 64 MB, with a
     warning when hit.
+12. **VU1 pipeline bookkeeping** (`vu/ps2_vu1_core.cpp`, `ps2_vu1.h`). In the 3D scenes about 40%
+    of the game thread was the VU1 interpreter scanning its ~50 pending-result slots twice on
+    every cycle. It now keeps the earliest cycle anything is due (`m_nextCommitCycle`, updated
+    where results are queued), skips the scan until then, commits and finds the next due cycle in
+    one pass, and walks VI register masks by set bit. Same results; the VU1 tests pass.
+13. **Window and picture** (`ps2_runtime.cpp`). `PS2X_WINDOW_SIZE=<w>x<h>` sets the starting
+    window size, F11 toggles borderless fullscreen, and `PS2X_ASPECT` shows the frame at `4:3` or
+    `16:9` as a TV would, or `stretch`es it to the window; otherwise pixels stay square (a 512x448
+    frame came out as a narrow pillarbox). The Sub Rebellion override sets 4:3.
+14. **IOP library at the same optimisation level as the runtime library**
+    (`ps2xRuntime/CMakeLists.txt`) and a cheaper import-stub check per IOP instruction
+    (`iop_emulator.cpp`: decode an import only when the word at the PC is `jr $ra`).
 
 Also in the patch, off unless set (the lookups are cached, so they cost nothing when unset):
 - `PS2X_FRAME_DUMP=<dir>`: every 30th presented frame as raw RGBA, display-register probes, and
@@ -129,6 +143,9 @@ Also in the patch, off unless set (the lookups are cached, so they cost nothing 
 - `PS2X_RUNTIME_LIB_COMPILE_OPTIONS` (CMake): build the runtime library at e.g. `-O2`.
 - `PS2X_IOP_PC_LOG=1`: every 3 s, where IOP threads are when their timeslices end and the most
   read IOP hardware registers (found the `MUS.IRX` bind loop at 0x5D2F4).
+- `PS2X_EE_TIMESLICE=off`: the PS2 kernel's scheduling, where a thread runs until it waits or a
+  higher-priority thread is ready. By default PS2Recomp also rotates equal-priority threads every
+  65536 cycles. (Tried while chasing the mission hang; it wasn't the cause, so it stays off.)
 - `PS2X_FINISH_LOG=1`: each VIF1 DMA chain that stops on a non-END tag, with the GS FINISH
   writes since the last one, CSR, and pending VIF1 DIRECT/IMAGE state (found fix 11).
 
@@ -140,10 +157,32 @@ patch too. The patch adds one test (fix 5) and replaces one (fix 6).
 ## Game-specific overrides (`overrides/`)
 
 `zz_sub_rebellion_overrides.cpp` registers a PS2Recomp game override for `SLUS_205.48`. It
-sets `PS2X_DEINTERLACE=weave`, makes stdout unbuffered (so a redirected `log.txt` stays
-current), and replaces `racMoviePlay` (0x114218) with a stand-in that returns 0 without creating the movie
-object, which is what the game does for an unknown movie id; no caller uses the result. The
-logo sequence then moves straight on. Set `PS2X_PLAY_MOVIES=1` to turn the skip off.
+sets `PS2X_DEINTERLACE=weave` and `PS2X_ASPECT=4:3`, makes stdout unbuffered (so a redirected
+`log.txt` stays current), and:
+
+- replaces `racMoviePlay` (0x114218) with a stand-in that returns 0 without creating the movie
+  object, which is what the game does for an unknown movie id; no caller uses the result. The
+  logo sequence then moves straight on. Set `PS2X_PLAY_MOVIES=1` to turn the skip off.
+- **waits for the mission data before building the stage.** NEW GAME sets `MissionReturnFlag`
+  (`title_main` -> `Set_MissionReturnFlag(1)`), and with it set `mission_wait` (0x126A80) builds
+  the stage (`CSTG_Create` -> `CFPO_Create`/`CFDO_Create`) as soon as `mission_title_main` sets
+  flag 0x20000 in the word at 0x268CD0, about 60 frames into the title card, skipping the
+  `readDoneCheckAll()`/`CTM_IsAllTextureReady()` wait it does on its other path. The game's read
+  queue (`readOpen`/`readPolling`) loads one file per `CdvdProc` tick, and `MOD_Load` plus
+  `CFM_Load` had just queued ~250 files, so only ~90 were in. `readGetAdr()` returned 0 for the
+  stage's models, and `CCDO_GetPositionInfoFromFile` parsed "text" from address 0, writing NULs
+  over the bottom 8 MB of RAM including the game's code and jump tables; `_strtod_r`'s jump
+  table then sent it to address 0 (the hang at "MISSION 01 / NOW LOADING"). The wrapper keeps
+  `mission_wait` returning, as it does while it waits, until the queue at gp-0x6A78 is empty,
+  every loaded entry's request is done and the textures are in. Those checks are the game's own
+  two functions rewritten without their side effects. Whether real hardware loads faster per
+  frame or the briefing normally leaves the files resident wasn't settled; either way the stage
+  now waits for its data.
+- `PS2X_CD_TRACE=1` logs the read module and CD calls (`readOpen`, `readGetAdr` with where the
+  file sits: loaded, queued or absent; `racCdvdRequest*`, `racCdvdSync`, `sceCdRead`,
+  `readDoneCheckAll`, `MissionLoad`, `mission_wait`, `CSTG_Create` with the mission flags).
+  Repeated polls with the same result are logged once. This is what found the above.
+
 `tools/setup_linux.sh` copies `overrides/*.cpp` into `ps2xRuntime/src/runner/`; the `zz_` name
 keeps it in the last unity-build batch, so editing it rebuilds in about 10 seconds.
 
@@ -178,11 +217,10 @@ title screen. On a Ryzen 7 9800X3D + RX 9070 XT the first build (single-threaded
 
 ## Next
 
-1. **Into a mission.** The intro now plays through; see what follows it and whether a mission
-   loads and takes pad input.
-2. **Speed**: the 3D scenes are VU1-interpreter-bound on the game thread (`commitReadyPipelines`,
-   `calculatePairReadyCycle` per cycle), plus triangle drawing. Cheaper VU1 pipeline bookkeeping,
-   then running GS work alongside the EE, then a GPU renderer.
+1. **Play Mission 01**: check steering, weapons and the mission's scripted events with a pad.
+2. **Speed**: the 3D scenes are still VU1-interpreter-bound on the game thread (cycle-exact FMAC
+   rounding with `long double`, per-cycle stalls), plus small triangles drawn on the game thread.
+   Running GS work alongside the EE, then a GPU renderer.
 3. **Sound**: SPU2 voices/ADPCM so `MUS.IRX`, `MODHSYN` and the `XA\*.VSD` streams play. Note
    `MUS.IRX` calls `modhsyn` export 23 (voice count) constantly, which keeps the IOP busy.
 4. **Movies**: IPU emulation, or decode the `.DSI` streams on the host. Skipped until then.

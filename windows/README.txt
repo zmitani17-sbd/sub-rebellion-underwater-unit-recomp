@@ -18,6 +18,7 @@ CONTROLS (keyboard)          XInput controllers also work.
   Z ............... Square       Enter .......... Start
   V ............... Triangle     Right Shift .... Select
   Q / E ........... L1 / R1      1 / 3 .......... L2 / R2
+  F11 ............. borderless fullscreen on/off
 
 WHAT TO EXPECT
   - Memory-card prompt: there's no save yet, press X to start without loading.
@@ -25,8 +26,14 @@ WHAT TO EXPECT
   - The logo and story movies are skipped (PS2 video decoding isn't emulated yet).
   - No sound yet.
   - Speed: the graphics are drawn by the CPU, so it runs well below 60 fps.
-  - Last tested: the 3D intro plays ("Fifteen years ago..."). Beyond that is untested.
-  - The window can be resized or maximized.
+  - Last tested: through the intro, base menu and world map into Mission 01 (the cockpit
+    and the in-mission tutorial run). Play beyond that is untested.
+  - "MISSION 01 / NOW LOADING" takes a while at this speed; the game now waits there until
+    the mission's files are loaded instead of crashing.
+  - The window opens at 1280x960 and can be resized or maximized; the picture is shown at
+    the PS2's 4:3. Other window size: set PS2X_WINDOW_SIZE=WIDTHxHEIGHT in
+    "Play Sub Rebellion.cmd". PS2X_ASPECT=16:9 stretches to widescreen, PS2X_ASPECT=stretch
+    fills the window.
   - Saves go to game\mc0.
 
 IF SOMETHING GOES WRONG

@@ -4,6 +4,8 @@ rem game prints goes to log.txt (useful if something breaks).
 setlocal
 if not exist "%~dp0game\SLUS_205.48" goto nosetup
 cd /d "%~dp0game"
+rem Window size at start (resizable; F11 toggles borderless fullscreen). The picture keeps 4:3.
+if not defined PS2X_WINDOW_SIZE set PS2X_WINDOW_SIZE=1280x960
 echo Sub Rebellion is running. Close the game window to quit.
 echo Log: "%~dp0log.txt"
 "%~dp0SubRebellion.exe" "%~dp0game\SLUS_205.48" > "%~dp0log.txt" 2>&1

@@ -121,7 +121,8 @@ Applies to PS2Recomp commit `e563698`. Each fix was needed to get further:
     of the game thread was the VU1 interpreter scanning its ~50 pending-result slots twice on
     every cycle. It now keeps the earliest cycle anything is due (`m_nextCommitCycle`, updated
     where results are queued), skips the scan until then, commits and finds the next due cycle in
-    one pass, and walks VI register masks by set bit. Same results; the VU1 tests pass.
+    one pass, and walks VI register masks by set bit; `normalizeOperand` is inline in the header.
+    Same results; the VU1 tests pass.
 13. **Window and picture** (`ps2_runtime.cpp`). `PS2X_WINDOW_SIZE=<w>x<h>` sets the starting
     window size, F11 toggles borderless fullscreen, and `PS2X_ASPECT` shows the frame at `4:3` or
     `16:9` as a TV would, or `stretch`es it to the window; otherwise pixels stay square (a 512x448
@@ -129,6 +130,30 @@ Applies to PS2Recomp commit `e563698`. Each fix was needed to get further:
 14. **IOP library at the same optimisation level as the runtime library**
     (`ps2xRuntime/CMakeLists.txt`) and a cheaper import-stub check per IOP instruction
     (`iop_emulator.cpp`: decode an import only when the word at the PC is `jr $ra`).
+15. **Game frame rate in the window title** (`ps2_runtime.cpp`, `ps2_memory.cpp`,
+    `Stubs/Helpers/Support.h`): "| game 4.3 fps" counts how often the game flips its displayed
+    buffer, at the EE's DISPFB1/2 writes and the `sceGsPutDispEnv` stand-in (which is how Sub
+    Rebellion flips), not window refreshes. An `[fps]` log line every 10 seconds adds the emulated
+    vblank rate.
+16. **Asynchronous GS** (`gs/gs_frontend.cpp`, `gs_frontend.h`, `ps2_memory.cpp`,
+    `ps2_runtime.cpp`; on with `PS2X_GS_ASYNC=1`, which the Sub Rebellion override sets). In
+    Mission 01 about half of the game thread was the software rasterizer. GIF packets (from
+    PATH1 XGKICK, PATH2/3 DMA and the native fast paths), image uploads and register writes are
+    now copied into a queue and run in order on a GS thread. Whatever hands GS results back waits
+    for the queue first: local->host reads (`consumeLocalToHostBytes`, so `graphProc`'s readback
+    and `sceGsExecStoreImage`), clears, reset, VRAM peeks, and every EE write to a privileged GS
+    register (and the `sceGsPutDispEnv` stand-in), so a CSR clear can't be undone by an older
+    FINISH still queued and a flip only shows a finished frame. The queue holds at most 16 MB; the
+    EE waits beyond that. A CSR poll does not wait: the EE spins on FINISH as it would on
+    hardware. (Making CSR reads wait too halved the front end's speed: the game reads CSR often.)
+    New test: `asynchronous GS draws the same VRAM as the synchronous GS`.
+
+    In the 2-core cloud container the EE's FINISH spin and the GS thread share the cores, so the
+    frame rate there stays about the same (2 fps in the 3D intro either way), but emulated time
+    no longer stands still while the GS draws: the vblank rate goes from 4/s to 10-35/s, and the
+    vblank-timed intro gets further in the same wall time. On a desktop CPU the GS thread has a
+    core to itself; `Play Sub Rebellion (no GS thread).cmd` (`PS2X_GS_ASYNC=0`) is there to
+    compare.
 
 Also in the patch, off unless set (the lookups are cached, so they cost nothing when unset):
 - `PS2X_FRAME_DUMP=<dir>`: every 30th presented frame as raw RGBA, display-register probes, and

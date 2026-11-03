@@ -285,6 +285,15 @@ namespace
             setenv("PS2X_DEINTERLACE", "weave", 0);
 #endif
         }
+        // Draw on a GS thread alongside the EE and VU1 (PS2X_GS_ASYNC=0 turns it off).
+        if (!std::getenv("PS2X_GS_ASYNC"))
+        {
+#ifdef _WIN32
+            _putenv("PS2X_GS_ASYNC=1");
+#else
+            setenv("PS2X_GS_ASYNC", "1", 0);
+#endif
+        }
         // The 512x448 frame fills a 4:3 TV; show it at 4:3 rather than with square pixels.
         if (!std::getenv("PS2X_ASPECT"))
         {

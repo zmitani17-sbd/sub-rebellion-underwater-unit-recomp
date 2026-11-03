@@ -25,7 +25,10 @@ WHAT TO EXPECT
   - Title: press Enter (Start), then NEW GAME and a difficulty.
   - The logo and story movies are skipped (PS2 video decoding isn't emulated yet).
   - No sound yet.
-  - Speed: the graphics are drawn by the CPU, so it runs well below 60 fps.
+  - Speed: the graphics are drawn by the CPU, so it runs well below 60 fps. The window title
+    shows the game's own frame rate ("game 4.3 fps"); log.txt gets it every 10 seconds.
+  - Drawing runs on its own thread next to the game. "Play Sub Rebellion (no GS thread).cmd"
+    starts it the old way (drawing on the game thread), for comparing the two.
   - Last tested: through the intro, base menu and world map into Mission 01 (the cockpit
     and the in-mission tutorial run). Play beyond that is untested.
   - "MISSION 01 / NOW LOADING" takes a while at this speed; the game now waits there until

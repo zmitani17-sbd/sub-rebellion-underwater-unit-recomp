@@ -162,6 +162,15 @@ Applies to PS2Recomp commit `e563698`. Each fix was needed to get further:
     SIF test reads it after 10 cycles). With it, emulated time in the menus keeps up with real
     time (60 vblanks/s instead of 20-30), so vblank-paced things, the CD loader included, run at
     PS2 speed there. All `ps2xIOP` tests pass.
+18. **`PS2X_VBLANK_NO_CATCHUP=1`** (`EeScheduler.cpp`; the Sub Rebellion override sets it).
+    Each vblank's wall-clock deadline was the previous deadline plus 16.7 ms, so after a slow
+    stretch (a load, a heavy scene) the missed vblanks fired back to back until the schedule
+    caught up with the clock: on a 9800X3D the log showed bursts of 100-167 vblanks a second,
+    the game running at up to 3x speed. With the option the schedule resumes from now instead.
+19. **GS thread load in the `[fps]` line**: how busy the GS thread was and how long other threads
+    waited for it, to tell a drawing-bound scene from an EE/VU1-bound one. In the 2-core
+    container the front end is drawing-bound (GS thread 85-98% busy) and the 3D intro is about
+    60%.
 
 Also in the patch, off unless set (the lookups are cached, so they cost nothing when unset):
 - `PS2X_FRAME_DUMP=<dir>`: every 30th presented frame as raw RGBA, display-register probes, and

@@ -491,7 +491,7 @@ index 67c8184..feffc77 100644
      uint32_t microAddressMask() const;
      int32_t readBranchVi(uint8_t reg) const;
 diff --git a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
-index c5e31c4..ca779f5 100644
+index c5e31c4..e6c125e 100644
 --- a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
 +++ b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
 @@ -1,3 +1,5 @@
@@ -603,6 +603,35 @@ index c5e31c4..ca779f5 100644
      if (cause < 32u && (mask & (1u << cause)) == 0u)
      {
          return;
+@@ -1843,15 +1902,26 @@ void EeScheduler::processDueDeadlines()
+             return;
+         }
+ 
++        // PS2X_VBLANK_NO_CATCHUP=1: after the host falls behind, don't fire the missed vblanks
++        // back to back to catch up with the wall clock (bursts of 100+ vblanks a second after a
++        // slow stretch); resume at most one period from now, as a slowed-down console would.
++        static const bool s_noCatchUp = []
++        {
++            const char *value = std::getenv("PS2X_VBLANK_NO_CATCHUP");
++            return value && std::strcmp(value, "0") != 0;
++        }();
+         for (ScheduledEvent &scheduled : due)
+         {
+             if (scheduled.event.type == EeEventType::VBlankStart)
+             {
++                auto startHost = scheduled.hostDeadline;
++                if (s_noCatchUp)
++                    startHost = std::max(startHost, std::chrono::steady_clock::now() - kVBlankPeriod);
+                 scheduleEvent(scheduled.deadlineCycle + kVBlankDurationCycles,
+-                              scheduled.hostDeadline + kVBlankDuration,
++                              startHost + kVBlankDuration,
+                               EeEvent{EeEventType::VBlankEnd, 0, m_vsyncTick + 1u});
+                 scheduleEvent(scheduled.deadlineCycle + kVBlankPeriodCycles,
+-                              scheduled.hostDeadline + kVBlankPeriod,
++                              startHost + kVBlankPeriod,
+                               EeEvent{EeEventType::VBlankStart, 0, 0});
+             }
+             processEvent(scheduled.event);
 diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/Helpers/Support.h b/ps2xRuntime/src/lib/Kernel/Stubs/Helpers/Support.h
 index b1bb6d8..d25c74c 100644
 --- a/ps2xRuntime/src/lib/Kernel/Stubs/Helpers/Support.h
@@ -1229,26 +1258,41 @@ index f0ad507..7e8755f 100644
      const GSFrameReg displayFrame1 = decodeDisplayFrame(request.dispfb1);
      const GSFrameReg displayFrame2 = decodeDisplayFrame(request.dispfb2);
 diff --git a/ps2xRuntime/src/lib/gs/gs_frontend.cpp b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
-index 9281d5f..588ebac 100644
+index 9281d5f..d2e7d9a 100644
 --- a/ps2xRuntime/src/lib/gs/gs_frontend.cpp
 +++ b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
-@@ -1,5 +1,6 @@
+@@ -1,8 +1,10 @@
  #include "runtime/gs/gs_frontend.h"
  #include "runtime/gs/gs_cpu_backend.h"
 +#include "ThreadNaming.h"
  #include "ps2_log.h"
  #include "runtime/ps2_memory.h"
  #include <atomic>
-@@ -10,6 +11,8 @@
++#include <chrono>
+ #include <algorithm>
+ #include <cmath>
+ #include <cstdio>
+@@ -10,6 +12,19 @@
  #include <iostream>
  #include <sstream>
  
 +std::atomic<uint32_t> g_finishWrites{0u}; // GS FINISH writes, read by ps2_memory.cpp (PS2X_FINISH_LOG)
 +
++// Asynchronous GS load, for the [fps] log line: time the GS thread spent drawing, and time other
++// threads spent waiting for it (queue full, or a sync point).
++static std::atomic<uint64_t> g_gsAsyncBusyNs{0u};
++static std::atomic<uint64_t> g_gsAsyncWaitNs{0u};
++uint64_t gsAsyncBusyNs() { return g_gsAsyncBusyNs.load(std::memory_order_relaxed); }
++uint64_t gsAsyncWaitNs() { return g_gsAsyncWaitNs.load(std::memory_order_relaxed); }
++static uint64_t gsElapsedNs(std::chrono::steady_clock::time_point since)
++{
++    return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - since).count());
++}
++
  namespace
  {
      static constexpr uint32_t kHostFrameWidth = 640u;
-@@ -111,6 +114,141 @@ GS::GS()
+@@ -111,6 +126,152 @@ GS::GS()
      reset();
  }
  
@@ -1295,8 +1339,12 @@ index 9281d5f..588ebac 100644
 +    if (!queueingAsync())
 +        return;
 +    std::unique_lock<std::mutex> lock(m_asyncMutex);
++    if (m_asyncQueue.empty() && !m_asyncBusy)
++        return;
++    const auto start = std::chrono::steady_clock::now();
 +    m_asyncIdle.wait(lock, [this]()
 +                     { return m_asyncQueue.empty() && !m_asyncBusy; });
++    g_gsAsyncWaitNs.fetch_add(gsElapsedNs(start), std::memory_order_relaxed);
 +}
 +
 +void GS::enqueueAsync(AsyncCommand &&command)
@@ -1306,8 +1354,13 @@ index 9281d5f..588ebac 100644
 +    const size_t bytes = command.data.size() + 64u;
 +    {
 +        std::unique_lock<std::mutex> lock(m_asyncMutex);
-+        m_asyncSpace.wait(lock, [this]()
-+                          { return m_asyncQueuedBytes < kMaxQueuedBytes || m_asyncStop; });
++        if (m_asyncQueuedBytes >= kMaxQueuedBytes && !m_asyncStop)
++        {
++            const auto start = std::chrono::steady_clock::now();
++            m_asyncSpace.wait(lock, [this]()
++                              { return m_asyncQueuedBytes < kMaxQueuedBytes || m_asyncStop; });
++            g_gsAsyncWaitNs.fetch_add(gsElapsedNs(start), std::memory_order_relaxed);
++        }
 +        m_asyncQueuedBytes += bytes;
 +        m_asyncQueue.push_back(std::move(command));
 +    }
@@ -1361,6 +1414,7 @@ index 9281d5f..588ebac 100644
 +            m_asyncBusy = true;
 +        }
 +        size_t bytes = 0u;
++        const auto batchStart = std::chrono::steady_clock::now();
 +        for (const AsyncCommand &command : batch)
 +        {
 +            bytes += command.data.size() + 64u;
@@ -1374,6 +1428,7 @@ index 9281d5f..588ebac 100644
 +            }
 +        }
 +        batch.clear();
++        g_gsAsyncBusyNs.fetch_add(gsElapsedNs(batchStart), std::memory_order_relaxed);
 +        {
 +            std::lock_guard<std::mutex> lock(m_asyncMutex);
 +            m_asyncQueuedBytes -= std::min(bytes, m_asyncQueuedBytes);
@@ -1390,7 +1445,7 @@ index 9281d5f..588ebac 100644
  void GS::init(uint8_t *vram, uint32_t vramSize, GSRegisters *privRegs)
  {
      m_localMemoryStorage = vram;
-@@ -124,6 +262,7 @@ void GS::init(uint8_t *vram, uint32_t vramSize, GSRegisters *privRegs)
+@@ -124,6 +285,7 @@ void GS::init(uint8_t *vram, uint32_t vramSize, GSRegisters *privRegs)
  
  void GS::reset()
  {
@@ -1398,7 +1453,7 @@ index 9281d5f..588ebac 100644
      std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
      std::memset(m_ctx, 0, sizeof(m_ctx));
      m_prim = {};
-@@ -552,6 +691,20 @@ void GS::latchHostPresentationFrame()
+@@ -552,6 +714,20 @@ void GS::latchHostPresentationFrame()
      }
  
      const bool hasFrame = static_cast<bool>(frame);
@@ -1419,7 +1474,7 @@ index 9281d5f..588ebac 100644
      const uint32_t displayFbp = frame.displayFbp;
      const uint32_t sourceFbp = frame.sourceFbp;
      const uint32_t width = frame.width;
-@@ -639,6 +792,21 @@ bool GS::copyLatchedHostPresentationFrame(std::vector<uint8_t> &outPixels,
+@@ -639,6 +815,21 @@ bool GS::copyLatchedHostPresentationFrame(std::vector<uint8_t> &outPixels,
  }
  
  void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
@@ -1441,7 +1496,7 @@ index 9281d5f..588ebac 100644
  {
      std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
      if (!data || sizeBytes < 16 || !m_backend)
-@@ -738,6 +906,22 @@ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
+@@ -738,6 +929,22 @@ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
  }
  
  bool GS::processNativePackedGIFPacket(const uint8_t *data, uint32_t sizeBytes)
@@ -1464,7 +1519,7 @@ index 9281d5f..588ebac 100644
  {
      std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
      if (!data || sizeBytes < 16u || !m_backend)
-@@ -784,6 +968,20 @@ void GS::uploadImageNative(uint64_t bitbltbuf,
+@@ -784,6 +991,20 @@ void GS::uploadImageNative(uint64_t bitbltbuf,
                             const uint8_t *data,
                             uint32_t sizeBytes)
  {
@@ -1485,7 +1540,7 @@ index 9281d5f..588ebac 100644
      std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
      uploadImageNativeUnlocked(bitbltbuf, trxpos, trxreg, trxdir, data, sizeBytes);
  }
-@@ -1062,6 +1260,15 @@ void GS::writeRegisterPacked(uint8_t regDesc, uint64_t lo, uint64_t hi)
+@@ -1062,6 +1283,15 @@ void GS::writeRegisterPacked(uint8_t regDesc, uint64_t lo, uint64_t hi)
  
  void GS::writeRegister(uint8_t regAddr, uint64_t value)
  {
@@ -1501,7 +1556,7 @@ index 9281d5f..588ebac 100644
      std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
      writeRegisterUnlocked(regAddr, value);
  }
-@@ -1477,6 +1684,7 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
+@@ -1477,6 +1707,7 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
      }
      case GS_REG_FINISH:
      {
@@ -1509,7 +1564,7 @@ index 9281d5f..588ebac 100644
          if (m_backend)
          {
              m_backend->Flush();
-@@ -1617,18 +1825,21 @@ void GS::processImageData(const uint8_t *data, uint32_t sizeBytes)
+@@ -1617,18 +1848,21 @@ void GS::processImageData(const uint8_t *data, uint32_t sizeBytes)
  
  bool GS::clearFramebufferContext(uint32_t contextIndex, uint32_t rgba)
  {
@@ -1531,7 +1586,7 @@ index 9281d5f..588ebac 100644
      std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
      return m_backend ? m_backend->ConsumeLocalToHostBytes(dst, maxBytes) : 0u;
  }
-@@ -1638,6 +1849,7 @@ void GS::setRasterBackend(std::unique_ptr<GSRasterBackend> backend)
+@@ -1638,6 +1872,7 @@ void GS::setRasterBackend(std::unique_ptr<GSRasterBackend> backend)
      if (!backend)
          backend = std::make_unique<GSCpuBackend>();
  
@@ -1539,7 +1594,7 @@ index 9281d5f..588ebac 100644
      std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
      std::lock_guard<std::mutex> backendLock(m_backendLifetimeMutex);
      if (m_backend)
-@@ -1664,12 +1876,14 @@ void GS::setRasterBackend(std::unique_ptr<GSRasterBackend> backend)
+@@ -1664,12 +1899,14 @@ void GS::setRasterBackend(std::unique_ptr<GSRasterBackend> backend)
  
  uint32_t GS::ReadVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y) const
  {
@@ -1896,7 +1951,7 @@ index 37b6a4d..c536101 100644
      {
          if (m_path3Masked)
 diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
-index 45cb9d2..214c70b 100644
+index 45cb9d2..28275e1 100644
 --- a/ps2xRuntime/src/lib/ps2_runtime.cpp
 +++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
 @@ -1,3 +1,6 @@
@@ -1906,7 +1961,7 @@ index 45cb9d2..214c70b 100644
  #include "ps2_runtime.h"
  #include "ps2_log.h"
  #include "ps2_stubs.h"
-@@ -27,6 +30,11 @@
+@@ -27,6 +30,13 @@
  #include <unordered_map>
  #include <sstream>
  
@@ -1914,11 +1969,13 @@ index 45cb9d2..214c70b 100644
 +void setGsLocalToHostReader(std::function<uint32_t(uint8_t *, uint32_t)> reader); // ps2_memory.cpp
 +void setGsWaitIdle(std::function<void()> waitIdle);                                  // ps2_memory.cpp
 +uint64_t gsDisplayFlipCount();                                                        // ps2_memory.cpp
++uint64_t gsAsyncBusyNs();                                                             // gs_frontend.cpp
++uint64_t gsAsyncWaitNs();                                                             // gs_frontend.cpp
 +
  namespace ps2_stubs
  {
      void resetSifState();
-@@ -42,6 +50,8 @@ static constexpr int FB_HEIGHT = 512;
+@@ -42,6 +52,8 @@ static constexpr int FB_HEIGHT = 512;
  static constexpr int DEFAULT_DISPLAY_HEIGHT = 448;
  static constexpr uint32_t DEFAULT_FB_SIZE = FB_WIDTH * FB_HEIGHT * 4;
  static constexpr uint32_t DEFAULT_FB_ADDR = (PS2_RAM_SIZE - DEFAULT_FB_SIZE - 0x10000u);
@@ -1927,7 +1984,7 @@ index 45cb9d2..214c70b 100644
  #if defined(PLATFORM_VITA)
  static constexpr int HOST_WINDOW_WIDTH = 960;
  static constexpr int HOST_WINDOW_HEIGHT = 544;
-@@ -407,12 +417,41 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
+@@ -407,12 +419,41 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
      uint32_t displayFbp = 0u;
      uint32_t sourceFbp = 0u;
      bool usedPreferredDisplaySource = false;
@@ -1971,7 +2028,7 @@ index 45cb9d2..214c70b 100644
      {
          Image blank = GenImageColor(FB_WIDTH, FB_HEIGHT, MAGENTA);
          UpdateTexture(tex, blank.data);
-@@ -444,6 +483,22 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
+@@ -444,6 +485,22 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
          }
          ++s_uploadDebugCount;
      });
@@ -1994,7 +2051,7 @@ index 45cb9d2..214c70b 100644
      s_lastDisplayFbp = displayFbp;
      s_lastSourceFbp = sourceFbp;
      s_lastPreferred = usedPreferredDisplaySource;
-@@ -668,6 +723,10 @@ bool PS2Runtime::syncCoreSubsystems()
+@@ -668,6 +725,10 @@ bool PS2Runtime::syncCoreSubsystems()
      m_gifArbiter.setProcessPacketFn([this](const uint8_t *data, uint32_t size)
                                      { m_gs.processGIFPacket(data, size); });
      m_memory.setGifArbiter(&m_gifArbiter);
@@ -2005,7 +2062,7 @@ index 45cb9d2..214c70b 100644
      m_memory.setVu1MscalCallback([this](uint32_t startPC, uint32_t top, uint32_t itop)
                                   {
                                       R5900Context *cpuContext = m_eeScheduler ? m_eeScheduler->currentContext() : nullptr;
-@@ -715,6 +774,7 @@ bool PS2Runtime::syncCoreSubsystems()
+@@ -715,6 +776,7 @@ bool PS2Runtime::syncCoreSubsystems()
  
  bool PS2Runtime::initialize(const char *title)
  {
@@ -2013,7 +2070,7 @@ index 45cb9d2..214c70b 100644
      try
      {
          if (!m_memory.initialize())
-@@ -732,7 +792,19 @@ bool PS2Runtime::initialize(const char *title)
+@@ -732,7 +794,19 @@ bool PS2Runtime::initialize(const char *title)
          InitWindow(HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT, title); // raylib vita does not support audio
  #else
          SetConfigFlags(FLAG_WINDOW_RESIZABLE);
@@ -2034,7 +2091,7 @@ index 45cb9d2..214c70b 100644
          InitAudioDevice();
          m_audioBackend.setAudioReady(IsAudioDeviceReady());
  #endif
-@@ -2364,6 +2436,13 @@ void PS2Runtime::run()
+@@ -2364,6 +2438,13 @@ void PS2Runtime::run()
  
      std::atomic<bool> gameThreadFinished{false};
  
@@ -2048,7 +2105,7 @@ index 45cb9d2..214c70b 100644
      std::thread gameThread([&]()
                             {
          ThreadNaming::SetCurrentThreadName("GameThread");
-@@ -2424,15 +2503,62 @@ void PS2Runtime::run()
+@@ -2424,15 +2505,76 @@ void PS2Runtime::run()
          uint32_t presentHeight = DEFAULT_DISPLAY_HEIGHT;
          UploadFrame(frameTex, this, presentWidth, presentHeight);
  
@@ -2061,6 +2118,8 @@ index 45cb9d2..214c70b 100644
 +            // with the emulated vblank rate. The window itself refreshes at the host rate.
 +            static uint64_t s_lastFlips = gsDisplayFlipCount();
 +            static uint64_t s_lastVsync = m_eeScheduler->currentVSyncTick();
++            static uint64_t s_lastGsBusy = gsAsyncBusyNs();
++            static uint64_t s_lastGsWait = gsAsyncWaitNs();
 +            static uint32_t s_reports = 0u;
 +            static double s_windowStart = GetTime();
 +            const double now = GetTime();
@@ -2073,10 +2132,22 @@ index 45cb9d2..214c70b 100644
 +                char text[64];
 +                std::snprintf(text, sizeof(text), " | game %.1f fps", fps);
 +                SetWindowTitle((g_windowTitle + text).c_str());
++                const uint64_t gsBusy = gsAsyncBusyNs();
++                const uint64_t gsWait = gsAsyncWaitNs();
 +                if (++s_reports % 10u == 0u)
-+                    std::printf("[fps] game %.1f fps, vblank %.1f/s\n", fps, static_cast<double>(vsync - s_lastVsync) / seconds);
++                {
++                    if (m_gs.isAsync())
++                        std::printf("[fps] game %.1f fps, vblank %.1f/s, GS thread busy %.0f%%, waited on %.0f%%\n", fps,
++                                    static_cast<double>(vsync - s_lastVsync) / seconds,
++                                    100.0 * static_cast<double>(gsBusy - s_lastGsBusy) / (seconds * 1e9),
++                                    100.0 * static_cast<double>(gsWait - s_lastGsWait) / (seconds * 1e9));
++                    else
++                        std::printf("[fps] game %.1f fps, vblank %.1f/s\n", fps, static_cast<double>(vsync - s_lastVsync) / seconds);
++                }
 +                s_lastFlips = flips;
 +                s_lastVsync = vsync;
++                s_lastGsBusy = gsBusy;
++                s_lastGsWait = gsWait;
 +                s_windowStart = now;
 +            }
 +        }
